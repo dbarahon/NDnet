@@ -1,4 +1,5 @@
 from config import *
+import config as cfg
 from data_handling import *
 from utils import *
 from NN_construct import *
