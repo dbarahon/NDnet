@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import xarray as xr
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, WeightedRandomSampler
 
 
 # ============================================================
@@ -354,8 +354,6 @@ def tensorize_campaign_inputs_from_existing(
         dtype=torch.bool
     )
 
-    flight_id = torch.as_tensor(campaign_ds["flightID"].values.astype(np.int64), dtype=torch.long)
-
     campaign_names_seg = np.asarray(campaign_ds["campaign"].values).astype("U")
     uniq_campaigns, inv_campaign = np.unique(campaign_names_seg, return_inverse=True)
     campaign_id = torch.as_tensor(inv_campaign.astype(np.int64), dtype=torch.long)
@@ -371,37 +369,221 @@ def tensorize_campaign_inputs_from_existing(
     if T > 1:
         offsets_np[1:] = np.cumsum(counts_np[:-1])
 
-    bundle = {
-        "time_idx": time_idx,
-        "ilat": ilat,
-        "ilon": ilon,
-        "p_merra": p_merra,
-        "y_mean": y_mean,
-        "y_std": y_std,
-        "y_aug": y_aug,
-        "valid_obs": valid_obs,
-        "aug_valid": aug_valid,
-        "flight_id": flight_id,
-        "campaign_id": campaign_id,
-        "segment_gid": segment_gid,
-        "day_ns": day_ns,
-        "time_offsets": torch.as_tensor(offsets_np, dtype=torch.long),
-        "time_counts": torch.as_tensor(counts_np, dtype=torch.long),
-        "campaign_names": list(uniq_campaigns.tolist()),
-        "time_coord_ns": template_time,
-    }
+    if "flightID" in campaign_ds:
+        flight_id_np = campaign_ds["flightID"].values.astype(np.int64)
+    else:
+        flight_id_np = np.zeros((campaign_ds.sizes["segment"],), dtype=np.int64)
+
+    flight_id = torch.as_tensor(flight_id_np, dtype=torch.long)
+
+    bundle = CampaignTensorBundle(
+        time_idx=time_idx,
+        ilat=ilat,
+        ilon=ilon,
+        p_merra=p_merra,
+        y_mean=y_mean,
+        y_std=y_std,
+        y_aug=y_aug,
+        valid_obs=valid_obs,
+        aug_valid=aug_valid,
+        flight_id=flight_id,
+        campaign_id=campaign_id,
+        segment_gid=segment_gid,
+        day_ns=day_ns,
+        time_offsets=torch.as_tensor(offsets_np, dtype=torch.long),
+        time_counts=torch.as_tensor(counts_np, dtype=torch.long),
+        campaign_names=list(uniq_campaigns.tolist()),
+        time_coord_ns=template_time,
+        sort_index=np.arange(time_idx.numel(), dtype=np.int64),
+        input_channels=[],
+    )
 
     if pin_memory:
-        for k, v in bundle.items():
-            if isinstance(v, torch.Tensor):
-                bundle[k] = v.pin_memory()
+        for f in bundle.__dataclass_fields__:
+            val = getattr(bundle, f)
+            if isinstance(val, torch.Tensor):
+                setattr(bundle, f, val.pin_memory())
 
     if verbose:
-        print("[DBG] campaign bundle segments:", int(bundle["time_idx"].numel()))
-        print("[DBG] campaign aug shape:", tuple(bundle["y_aug"].shape))
-        print("[DBG] campaigns:", bundle["campaign_names"])
+        print("[DBG] campaign bundle segments:", int(bundle.time_idx.numel()))
+        print("[DBG] campaign aug shape:", tuple(bundle.y_aug.shape))
+        print("[DBG] campaigns:", bundle.campaign_names)
 
     return bundle
+
+
+class EOFNdMultiObsDatasetTorch(Dataset):
+    """
+    Daily dataset combining fixed-site tensors and optional campaign segment tensors.
+    """
+    def __init__(self, X2d_t, MU0_t, YS_t, VS_t, Nds_t, Eds_t, campaign_bundle=None, time_idx=None):
+        self.X2d = X2d_t
+        self.MU0 = MU0_t
+        self.YS = YS_t
+        self.VS = VS_t
+        self.Nds = Nds_t
+        self.Eds = Eds_t
+        self.B = campaign_bundle
+        if time_idx is None:
+            time_idx = np.arange(self.X2d.shape[0], dtype=np.int64)
+        self.time_idx = np.asarray(time_idx, dtype=np.int64)
+
+    def __len__(self):
+        return self.time_idx.size
+
+    def __getitem__(self, i):
+        t = int(self.time_idx[i])
+        out = {
+            "x2d": self.X2d[t],
+            "mu0": self.MU0[t],
+            "yS": self.YS[t],
+            "vS": self.VS[t],
+            "Nds": self.Nds[t],
+            "Eds": self.Eds[t],
+            "time_idx": torch.tensor(t, dtype=torch.long),
+        }
+        if self.B is None:
+            return out
+
+        s0 = int(self.B.time_offsets[t].item())
+        n = int(self.B.time_counts[t].item())
+        s1 = s0 + n
+        out.update({
+            "seg_ilat": self.B.ilat[s0:s1],
+            "seg_ilon": self.B.ilon[s0:s1],
+            "seg_p": self.B.p_merra[s0:s1],
+            "seg_y_mean": self.B.y_mean[s0:s1],
+            "seg_y_std": self.B.y_std[s0:s1],
+            "seg_y_aug": self.B.y_aug[:, s0:s1],
+            "seg_valid_obs": self.B.valid_obs[s0:s1],
+            "seg_aug_valid": self.B.aug_valid[:, s0:s1],
+            "seg_flight_id": self.B.flight_id[s0:s1],
+            "seg_campaign_id": self.B.campaign_id[s0:s1],
+            "seg_gid": self.B.segment_gid[s0:s1],
+            "seg_day_ns": self.B.day_ns[s0:s1],
+        })
+        return out
+
+
+def make_equal_site_time_sampler(VS_t, time_idx, min_sites=1, beta=1.0, eps=1.0):
+    """
+    Build a simple inverse-frequency sampler over days based on count of valid sites.
+    """
+    time_idx = np.asarray(time_idx, dtype=np.int64)
+    if time_idx.size == 0:
+        return time_idx, None
+
+    if isinstance(VS_t, torch.Tensor):
+        valid_counts = VS_t[time_idx].to(torch.float32).sum(dim=1).cpu().numpy()
+    else:
+        valid_counts = np.asarray(VS_t)[time_idx].astype(np.float32).sum(axis=1)
+
+    keep = valid_counts >= float(min_sites)
+    t_keep = time_idx[keep]
+    if t_keep.size == 0:
+        return time_idx, None
+
+    c = np.maximum(valid_counts[keep], float(eps))
+    weights = (1.0 / c) ** float(beta)
+    weights = torch.as_tensor(weights / np.maximum(weights.mean(), 1e-12), dtype=torch.double)
+    sampler = WeightedRandomSampler(weights=weights, num_samples=len(t_keep), replacement=True)
+    return t_keep, sampler
+
+
+def make_multiobs_collate_fn(use_campaign_aug=True, aug_mode="random_valid", seed=1234):
+    rng = np.random.default_rng(seed)
+
+    def _choose_targets(y_mean, y_aug, aug_valid):
+        Ns = int(y_mean.numel())
+        if Ns == 0 or (not use_campaign_aug) or aug_mode == "none" or y_aug.numel() == 0:
+            return y_mean, torch.full((Ns,), -1, dtype=torch.long)
+
+        A = y_aug.shape[0]
+        if aug_mode == "fixed":
+            a = 0
+            y = y_aug[a].clone()
+            bad = ~aug_valid[a]
+            y[bad] = y_mean[bad]
+            return y, torch.full((Ns,), a, dtype=torch.long)
+
+        y = y_mean.clone()
+        used = torch.full((Ns,), -1, dtype=torch.long)
+        aug_valid_np = aug_valid.cpu().numpy()
+        for j in range(Ns):
+            vv = np.flatnonzero(aug_valid_np[:, j])
+            if vv.size > 0:
+                a = int(rng.choice(vv))
+                y[j] = y_aug[a, j]
+                used[j] = a
+        return y, used
+
+    def collate(batch):
+        out = {
+            "x2d": torch.stack([b["x2d"] for b in batch], dim=0),
+            "mu0": torch.stack([b["mu0"] for b in batch], dim=0),
+            "yS": torch.stack([b["yS"] for b in batch], dim=0),
+            "vS": torch.stack([b["vS"] for b in batch], dim=0),
+            "Nds": torch.stack([b["Nds"] for b in batch], dim=0),
+            "Eds": torch.stack([b["Eds"] for b in batch], dim=0),
+            "time_idx": torch.stack([b["time_idx"] for b in batch], dim=0),
+        }
+
+        if "seg_ilat" not in batch[0]:
+            return out
+
+        seg_batch_idx = []
+        seg_ilat = []
+        seg_ilon = []
+        seg_p = []
+        seg_y = []
+        seg_y_std = []
+        seg_valid_obs = []
+        seg_flight_id = []
+        seg_campaign_id = []
+
+        for ib, b in enumerate(batch):
+            Ns = int(b["seg_ilat"].numel())
+            if Ns == 0:
+                continue
+            y_target, _ = _choose_targets(b["seg_y_mean"], b["seg_y_aug"], b["seg_aug_valid"])
+
+            seg_batch_idx.append(torch.full((Ns,), ib, dtype=torch.long))
+            seg_ilat.append(b["seg_ilat"])
+            seg_ilon.append(b["seg_ilon"])
+            seg_p.append(b["seg_p"])
+            seg_y.append(y_target)
+            seg_y_std.append(b["seg_y_std"])
+            seg_valid_obs.append(b["seg_valid_obs"])
+            seg_flight_id.append(b["seg_flight_id"])
+            seg_campaign_id.append(b["seg_campaign_id"])
+
+        if len(seg_batch_idx) == 0:
+            out.update({
+                "seg_batch_idx": torch.empty((0,), dtype=torch.long),
+                "seg_ilat": torch.empty((0,), dtype=torch.long),
+                "seg_ilon": torch.empty((0,), dtype=torch.long),
+                "seg_p": torch.empty((0,), dtype=torch.float32),
+                "seg_y": torch.empty((0,), dtype=torch.float32),
+                "seg_y_std": torch.empty((0,), dtype=torch.float32),
+                "seg_valid_obs": torch.empty((0,), dtype=torch.bool),
+                "seg_flight_id": torch.empty((0,), dtype=torch.long),
+                "seg_campaign_id": torch.empty((0,), dtype=torch.long),
+            })
+        else:
+            out.update({
+                "seg_batch_idx": torch.cat(seg_batch_idx, dim=0),
+                "seg_ilat": torch.cat(seg_ilat, dim=0),
+                "seg_ilon": torch.cat(seg_ilon, dim=0),
+                "seg_p": torch.cat(seg_p, dim=0),
+                "seg_y": torch.cat(seg_y, dim=0),
+                "seg_y_std": torch.cat(seg_y_std, dim=0),
+                "seg_valid_obs": torch.cat(seg_valid_obs, dim=0),
+                "seg_flight_id": torch.cat(seg_flight_id, dim=0),
+                "seg_campaign_id": torch.cat(seg_campaign_id, dim=0),
+            })
+        return out
+
+    return collate
 
 # ============================================================
 # Dataset over daily times
