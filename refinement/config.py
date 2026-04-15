@@ -1,0 +1,110 @@
+import sys
+import numpy as np
+import torch
+import xarray as xr
+
+MODEL_NAME =  "NDnet_EOFcoeff"
+
+
+do_train =  True
+do_sites = True 
+do_campaigns= True   
+do_test = True
+min_valid_lev =  2
+write_site_debug =  False 
+print_every =20
+bypass_infer= False
+
+prefix = '*200810*'
+#prefix = '*20[1-2]*'
+#test_pr = '*202001*' 
+test_pr = '*2009*' 
+
+sitemaskmode = "obs_dates" # "obs_levels" | "obs_dates" | "none" makes little difference, use dates though
+
+
+hp = {
+    "nepochs": 20,            # with better sampling, you usually do not need 1800
+    "batch_sz": 8,
+    "l_r": 1e-5,               # slightly lower for stability with stronger site weighting
+    "patience": 20,            # allow sampler+anneal to work
+    "model_name": MODEL_NAME,
+    "rolling_Nr": 3,
+    "basech": 64,
+    "site_sampling_beta": 1.,    # inverse-frequency; <1 softer; >1 more aggressive
+    "use_site_sampler": False,
+    "min_sites_for_sampling":1,
+    "lambda_sites": 0.001,           # increase; 50 is often still not enough
+    "lambda_anchor": 10,        # reduce anchor
+    "lambda_anchor_decay": 1,   # slower decay than 0.95 to keep stability
+    "lambda_anchor_min": 1,     # lower floor so sites can still move things late
+    "lambda_grad": 0,           # reduce TV; 1e-3 can block corrections, 
+    "lambda_nd": 0.005,
+    "lambda_Ndgauss": 1,
+    "lambda_sigma": 1,        # penalize sigma inflation (prevents ?cheating?)
+    "min_sigma": 1,            # if you expose it; tighten from 1e2
+    "err_mix": 0.15
+}
+
+
+# Paths / constants
+# -----------------------------
+MODELROOT = "/panfs/ccds02/nobackup/people/dbarahon/NDnet/EOF/in_cloudM2/best/"
+SITE_JSON = "/panfs/ccds02/nobackup/people/dbarahon/NDnet/data/dailies/Cloudnet_sites_multiyear/site_timeprofile_diagnostics.jsonl"
+
+legacy_path = MODELROOT + MODEL_NAME + "_weights.pt"
+train_cache_path =  "cache_train"
+test_cache_path =  "cache_test"
+    
+
+pth_all = '/panfs/ccds02/nobackup/people/dbarahon/NDnet/data/'
+
+t_chk = 16  
+vars_in_3d = {}
+# MODIS folder name under pth_all/dailies/
+modis_source = "MCD06COSP_D3_MODIS"   # <-- no trailing slash
+
+# Stats 
+vars_in_2d = {
+"Cloud_Optical_Thickness_Liquid_Mean": {"mean": 13.945,   "std": 9.665},
+"Cloud_Particle_Size_Liquid_Mean":     {"mean": 12.08,"std": 3.126},  # <-- use your real values here
+"Cloud_Retrieval_Fraction_Liquid_Mean":{"mean": 0.268,    "std": 0.205},
+"Cloud_Top_Pressure_Mean":             {"mean": 551.241,  "std": 177.277},
+}
+
+#here we have two vars out var:path
+vars_out = {
+'NDinc_cf01p': '/panfs/ccds02/nobackup/people/dbarahon/NDnet/data/dailies/Cloudnet_sites_multiyear', #masked site data  
+'a_resid_pred': '/panfs/ccds02/nobackup/people/dbarahon/NDnet/EOF/inference/bymonth', #precomputed residual alphas from base model
+}
+
+
+CAMPAIGN_TRAIN_DIR =  '/panfs/ccds02/nobackup/people/dbarahon/NDnet/data/field_campaigns/training'
+
+EOF_ds  = xr.open_dataset(f"{MODELROOT}Nd_EOF.nc")
+EOF     = EOF_ds["EOFs"]          # (mode, lev)
+Nd_mean = EOF_ds["Nd_mean"]       # (lev)
+num_modes = EOF.sizes["mode"]
+ # Load A_mean: IMPORTANT ? this was saved on Nout (training) grid
+A_mean = np.load(MODELROOT + MODEL_NAME + "_coeff_mean.npy")  # (M, lat, lon) on Nout grid
+# Fallback: zero mean where no samples exist
+A_mean = np.where(np.isnan(A_mean), 0.0, A_mean)
+Amean4 = A_mean[None, :, :, :]
+     
+    
+
+# -----------------------------------
+# Mode weights (variance-aware)
+# -----------------------------------
+# If eigenvalues were saved, use them.
+# Otherwise approximate using EOF energy.
+
+mode_var = np.sum(EOF.values**2, axis=1)
+
+mode_weights = torch.tensor(
+    mode_var / mode_var.mean(),
+    dtype=torch.float32
+)
+
+    
+    
