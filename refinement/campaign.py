@@ -210,7 +210,6 @@ def load_campaign_training_files(
     campaign_train_dir = Path(campaign_train_dir)
     files = sorted(campaign_train_dir.glob(campaign_pattern))
     
-    print(files)
     
     if not files:
         raise FileNotFoundError(f"No files matching {campaign_pattern} in {campaign_train_dir}")

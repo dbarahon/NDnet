@@ -216,6 +216,9 @@ def load_model_weights_for_inference(
 
 @torch.no_grad()
 def _eval_loop(model, criterion, loader, device, use_amp=True):
+    """
+    Standard eval loop: returns the full loss averaged over batches.
+    """
     model.eval()
     val_sum = 0.0
     val_n = 0
@@ -243,17 +246,73 @@ def _eval_loop(model, criterion, loader, device, use_amp=True):
     return val_sum / max(val_n, 1)
 
 
+@torch.no_grad()
+def _campaign_only_eval(model, criterion, loader, device, use_amp=True):
+    """
+    Evaluate ONLY the campaign contribution in eval mode on the provided loader.
+
+    This is intended as a monitored objective, not true validation.
+    We average only across batches that actually contain campaign points.
+
+    Returns
+    -------
+    campaign_eval_loss : float
+        Mean of (L_campaign + L_campaign_gauss) over batches with campaign points.
+        Returns 0.0 if no campaign points are present in the loader.
+    n_campaign_batches : int
+        Number of batches that contributed.
+    """
+    model.eval()
+    amp_enabled = (use_amp and device.type == "cuda")
+
+    camp_sum = 0.0
+    camp_n = 0
+
+    for batch in loader:
+        batch = _move_batch_to_device(batch, device)
+        x2d, mu0 = _extract_model_inputs(batch)
+
+        with autocast(device_type="cuda", enabled=amp_enabled):
+            mu, sigma = model(x2d, mu0)
+
+        with autocast(device_type="cuda", enabled=False):
+            _, parts = _criterion_from_batch(
+                criterion=criterion,
+                mu=mu,
+                sigma=sigma,
+                batch=batch,
+                return_parts=True,
+            )
+
+        n_campaign_valid = float(parts.get("n_campaign_valid", 0.0))
+        if n_campaign_valid > 0:
+            camp_loss = float(parts.get("L_campaign", 0.0)) + float(parts.get("L_campaign_gauss", 0.0))
+            camp_sum += camp_loss
+            camp_n += 1
+
+    if camp_n == 0:
+        return 0.0, 0
+
+    return camp_sum / camp_n, camp_n
+
+
 def training_val(model, criterion, train_loader, val_loader, optimizer, hp, device,
                  start_epoch=0, use_amp=True, clip_grad=0):
 
     scaler = GradScaler(enabled=(use_amp and device.type == "cuda"))
+
+    # IMPORTANT:
+    # Scheduler and early stopping now use monitor_loss, not raw val_loss.
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=20)
 
     lambda_anchor0 = float(getattr(criterion, "lambda_anchor", 0.0))
     anchor_decay   = float(hp.get("lambda_anchor_decay", 1.0))
     anchor_min     = float(hp.get("lambda_anchor_min", 0.0))
 
-    best_val = float("inf")
+    use_campaign_monitor = bool(hp.get("use_campaign_monitor", True))
+    campaign_monitor_beta = float(hp.get("campaign_monitor_beta", 1.0))
+
+    best_monitor = float("inf")
     bad_epochs = 0
     train_losses, val_losses = [], []
 
@@ -358,16 +417,41 @@ def training_val(model, criterion, train_loader, val_loader, optimizer, hp, devi
         t_train = time.perf_counter() - t0
         train_loss = train_sum / max(train_n, 1)
 
+        # -------------------------
+        # Normal validation
+        # -------------------------
         t1 = time.perf_counter()
         val_loss = _eval_loop(model, criterion, val_loader, device, use_amp=use_amp)
         t_val = time.perf_counter() - t1
 
-        scheduler.step(val_loss)
+        # -------------------------
+        # Campaign monitor on train loader, evaluated in eval mode
+        # -------------------------
+        if use_campaign_monitor:
+            t2 = time.perf_counter()
+            campaign_train_eval_loss, n_campaign_batches = _campaign_only_eval(
+                model, criterion, train_loader, device, use_amp=use_amp
+            )
+            t_camp_eval = time.perf_counter() - t2
+        else:
+            campaign_train_eval_loss = 0.0
+            n_campaign_batches = 0
+            t_camp_eval = 0.0
+
+        monitor_loss = val_loss + campaign_monitor_beta * campaign_train_eval_loss
+
+        # Scheduler sees the monitored objective
+        scheduler.step(monitor_loss)
 
         print(
             f"Epoch [{epoch+1}/{hp['nepochs']}], "
-            f"Train: {train_loss:.6f}, Val: {val_loss:.6f}, "
-            f"T(train): {t_train:.2f}s, T(val): {t_val:.2f}s, "
+            f"Train: {train_loss:.6f}, "
+            f"Val: {val_loss:.6f}, "
+            f"CampTrainEval: {campaign_train_eval_loss:.6f}, "
+            f"Monitor: {monitor_loss:.6f}, "
+            f"T(train): {t_train:.2f}s, "
+            f"T(val): {t_val:.2f}s, "
+            f"T(camp_eval): {t_camp_eval:.2f}s, "
             f"LR: {optimizer.param_groups[0]['lr']:.2e}",
             flush=True
         )
@@ -381,16 +465,23 @@ def training_val(model, criterion, train_loader, val_loader, optimizer, hp, devi
             step=int(step),
             train_loss=float(train_loss),
             val_loss=float(val_loss),
+            campaign_train_eval_loss=float(campaign_train_eval_loss),
+            campaign_monitor_beta=float(campaign_monitor_beta),
+            monitor_loss=float(monitor_loss),
+            n_campaign_monitor_batches=int(n_campaign_batches),
             t_train_s=float(t_train),
             t_val_s=float(t_val),
+            t_campaign_eval_s=float(t_camp_eval),
             lr=float(optimizer.param_groups[0]["lr"]),
         ), write_csv=True, write_jsonl=True)
 
         train_losses.append(train_loss)
-        val_losses.append(val_loss)
+        val_losses.append(monitor_loss)
 
-        if val_loss < best_val:
-            best_val = val_loss
+        # IMPORTANT:
+        # Best model / early stopping now follow monitor_loss
+        if monitor_loss < best_monitor:
+            best_monitor = monitor_loss
             bad_epochs = 0
             save_model_weights(model, hp["model_name"] + "_weights.pt")
             save_training_checkpoint(model, optimizer, epoch, hp["model_name"] + ".ckpt")

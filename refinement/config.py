@@ -12,24 +12,31 @@ do_campaigns= True
 do_test = True
 min_valid_lev =  2
 write_site_debug =  False 
-print_every =20
+print_every =100
 bypass_infer= False
 
-prefix = '*200810*'
-#prefix = '*20[1-2]*'
-#test_pr = '*202001*' 
-test_pr = '*2009*' 
+#prefix = '*2020*'
+prefix_dense = '*20[0-2]*'
+prefix_sites = '*20[1-2]*'
+test_pr = '*202001*' 
+#test_pr = '*2009*' 
+
+deb =  0
+if deb > 0:
+    prefix_dense = '*2020*'
+    prefix_sites = '*2020*'
+    print_every =10
 
 sitemaskmode = "obs_dates" # "obs_levels" | "obs_dates" | "none" makes little difference, use dates though
 
 
 hp = {
-    "nepochs": 20,            # with better sampling, you usually do not need 1800
-    "batch_sz": 8,
+    "nepochs": 2000,            # with better sampling, you usually do not need 1800
+    "batch_sz": 16,
     "l_r": 1e-5,               # slightly lower for stability with stronger site weighting
-    "patience": 20,            # allow sampler+anneal to work
+    "patience": 40,            # allow sampler+anneal to work
     "model_name": MODEL_NAME,
-    "rolling_Nr": 3,
+    "rolling_Nr": 10,
     "basech": 64,
     "site_sampling_beta": 1.,    # inverse-frequency; <1 softer; >1 more aggressive
     "use_site_sampler": False,
@@ -43,7 +50,11 @@ hp = {
     "lambda_Ndgauss": 1,
     "lambda_sigma": 1,        # penalize sigma inflation (prevents ?cheating?)
     "min_sigma": 1,            # if you expose it; tighten from 1e2
-    "err_mix": 0.15
+    "err_mix": 0.15, 
+    "use_campaign_monitor": True,
+	"campaign_monitor_beta": 1.0,
+    "lambda_campaign": 0.0005, 
+    "lambda_campaign_gauss": 1.0   
 }
 
 

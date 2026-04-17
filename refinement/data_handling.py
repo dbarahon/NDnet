@@ -704,6 +704,8 @@ def get_data(
     vars_in_2d=None,
     modis_source=None,
     prefix="",
+    dense_prefix=None,
+    site_prefix=None,
     cache_folder="cache",
     minP=250,
     site_json_path=None,
@@ -716,14 +718,25 @@ def get_data(
       Nd_sites  : xr.DataArray (time, lev, site)       conditioned Nd used for projection (Ns)
       Ares_base : xr.DataArray (time, mode, lat, lon)  dense base residual coeffs
       site_meta : xr.Dataset   (site) with ilat/ilon and lat/lon info
-    """
 
+    Notes
+    -----
+    - dense_prefix controls the dense base + MODIS inputs
+    - site_prefix controls which per-site files are selected
+    - if not provided, both default to the legacy `prefix` behavior
+    """
     if vars_out is None:
         vars_out = {}
     if vars_in_2d is None:
         vars_in_2d = {}
     if site_json_path is None:
         site_json_path = cfg.SITE_JSON
+
+    # backward-compatible defaults
+    if dense_prefix is None:
+        dense_prefix = prefix
+    if site_prefix is None:
+        site_prefix = prefix
 
     EOF     = cfg.EOF
     Nd_mean = cfg.Nd_mean
@@ -732,11 +745,14 @@ def get_data(
     chk2d = {"time": cfg.t_chk, "lat": -1, "lon": -1}
     chk3d = {"time": cfg.t_chk, "lev": -1, "lat": -1, "lon": -1}
 
+    print(f"[INFO] dense_prefix={dense_prefix!r}")
+    print(f"[INFO] site_prefix={site_prefix!r}")
+
     # ------------------------------------------------------------
     # 1) Load base residual coefficients (dense), defines template grid/time
     # ------------------------------------------------------------
     varname_base = list(vars_out.keys())[1]
-    pth_base = f"{vars_out[varname_base]}/{prefix}"
+    pth_base = f"{vars_out[varname_base]}/{dense_prefix}"
     print("[LOAD 3D OUT base]", pth_base, len(sorted(glob.glob(pth_base))), "files")
 
     Ab = xr.open_mfdataset(pth_base, parallel=False, chunks=chk3d)[varname_base]
@@ -751,9 +767,9 @@ def get_data(
     ))
 
     # ------------------------------------------------------------
-    # 2) Load MODIS 2D inputs, normalize (unchanged)
+    # 2) Load MODIS 2D inputs, normalize
     # ------------------------------------------------------------
-    pth2d = f"{pth_all}dailies/{modis_source}/on_Noutgrid/{modis_source}.{prefix}.nc"
+    pth2d = f"{pth_all}dailies/{modis_source}/on_Noutgrid/{modis_source}.{dense_prefix}.nc"
     print("[LOAD 2D IN]", pth2d)
     t0 = time.time()
 
@@ -785,10 +801,9 @@ def get_data(
     # 4) Site-only projection: observed Nd comes from per-site files
     # ------------------------------------------------------------
     varname_obs = list(vars_out.keys())[0]
-    
 
     A_sites, Nd_sites, Err_sites, site_meta = project_coeffs_at_sites_only(
-        Nout=Nout_template,                 # Abase reference
+        Nout=Nout_template,                  # Abase reference
         varname=varname_obs,
         EOF=EOF,
         Nd_mean=Nd_mean,
@@ -796,8 +811,8 @@ def get_data(
         site_json_path=site_json_path,
         min_valid_lev=cfg.min_valid_lev,
         write_debug=cfg.write_site_debug,
-        site_var_dir=vars_out[varname_obs], # directory holding per-site NetCDFs
-        site_prefix=prefix,                 # date-range token OR glob
+        site_var_dir=vars_out[varname_obs],  # directory holding per-site NetCDFs
+        site_prefix=site_prefix,             # <-- decoupled from dense_prefix
         minP=minP,
     )
 
@@ -813,7 +828,6 @@ def get_data(
     Nin_2d = Nin_2d.fillna(0)
 
     return Nin_2d, A_sites, Nd_sites, Err_sites, Ares_base, site_meta
-
     
     
     #############################################

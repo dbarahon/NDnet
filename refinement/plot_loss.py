@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 TRAIN_EVENTS = {"loss_step", "train_loss", "train_epoch", "loss_train"}
 VAL_EVENTS   = {"val_loss", "valid_loss", "validation_loss", "loss_val", "eval_loss", "loss_eval"}
 
-LOSS_KEYS = ["L_site", "L_nd", "L_anchor", "L_grad", "L_sig", "L_nd_gauss"]
+LOSS_KEYS = ["L_site", "L_nd", "L_anchor", "L_grad", "L_sig", "L_nd_gauss", "L_campaign", "L_campaign_gauss"]
 
 
 def iter_json_objects(path):

@@ -64,7 +64,8 @@ if __name__ == "__main__":
             pth_all=pth_all,
             vars_in_2d=vars_in_2d,
             modis_source=modis_source,
-            prefix=prefix,
+            dense_prefix=prefix_dense,   # full dense window, e.g. starts before 2011
+            site_prefix=prefix_sites,    # site-file token / glob
             cache_folder="cache",
             minP=250,
             site_json_path=SITE_JSON,
@@ -578,7 +579,8 @@ if __name__ == "__main__":
             pth_all=pth_all,
             vars_in_2d=vars_in_2d,
             modis_source=modis_source,
-            prefix=test_pr,
+            dense_prefix=test_pr,
+            site_prefix=test_pr,
             cache_folder="cache",
             minP=250,
             site_json_path=SITE_JSON,
