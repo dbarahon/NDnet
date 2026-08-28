@@ -13,10 +13,12 @@ import cartopy.feature as cfeature
 import matplotlib.colors as mcolors
 from matplotlib.gridspec import GridSpec
 import math
+import config as cfg
+
 np.set_printoptions(precision=3)
 
 
-#plotting and other utilities
+# plotting and other utilities
 ###########################################################
 def plot_global_level_comparison(
     Nd_base,
@@ -24,148 +26,245 @@ def plot_global_level_comparison(
     Nd_mean,
     levels,
     out_png,
-    minN=0.1,
+    minN=None,
 ):
+    """Journal-style global Nd comparison using Base as reference.
+
+    The map rows are ordered physically from lower pressure (higher altitude)
+    to higher pressure (lower altitude).  The bottom row is a latitude-pressure
+    zonal diagnostic plotted against the actual pressure coordinate, not level
+    indices.
+
+    Parameters
+    ----------
+    Nd_base, Nd_nn : xr.DataArray
+        (time, lev, lat, lon)
+    Nd_mean : xr.DataArray
+        Retained for backward compatibility with existing callers.
+    levels : sequence of float
+        Requested pressure levels in hPa. They are displayed in ascending
+        pressure order so altitude decreases from top to bottom.
+    out_png : str
+        Output file.
+    minN : float, optional
+        Minimum Nd used in the comparison. If omitted, cfg.MIN_ND is used.
     """
-    Global comparison using Base as reference.
-    Produces maps and zonal diagnostics for Base, NN, NN-Base, RMS.
-    """
+    if minN is None:
+        minN = float(getattr(cfg, "MIN_ND", 1.0))
+    else:
+        minN = float(minN)
 
     # ----------------------------
     # Masking
     # ----------------------------
-    B = Nd_base.where(Nd_base >= minN)
-    N = Nd_nn.where(B >= minN)
-    N = N.where(N >= minN)
+    B = Nd_base.where(np.isfinite(Nd_base) & (Nd_base >= minN))
+    N = Nd_nn.where(np.isfinite(Nd_nn) & (Nd_nn >= minN))
+    N = N.where(np.isfinite(B))
 
     # ----------------------------
-    # Time means
+    # Time means / relative metrics
     # ----------------------------
     avg_base = B.mean(dim="time", skipna=True)
-    avg_nn   = N.mean(dim="time", skipna=True)
+    avg_nn = N.mean(dim="time", skipna=True)
 
-    avg_diff = 100.0 * (avg_nn - avg_base) / np.clip(avg_base, 0.01, None)
+    denom = avg_base.where(avg_base >= minN)
+    avg_diff = 100.0 * (avg_nn - avg_base) / denom
 
-    # ----------------------------
-    # RMS relative to Base
-    # ----------------------------
     rms_3d = 100.0 * np.sqrt(
         ((N - B) ** 2).mean(dim="time", skipna=True)
-    ) / B.mean(dim="time", skipna=True)
+    ) / denom
+
+    # ----------------------------
+    # Physical pressure ordering
+    # ----------------------------
+    levels_plot = sorted(float(v) for v in levels)
 
     # ----------------------------
     # Figure layout
     # ----------------------------
     proj = ccrs.PlateCarree()
-    nrows = len(levels) + 1
+    nmap = len(levels_plot)
+    nrows = nmap + 1
 
-    fig = plt.figure(figsize=(14, 3.2 * len(levels) + 2))
+    fig = plt.figure(figsize=(14.0, 2.45 * nmap + 3.0))
     gs = GridSpec(
         nrows=nrows,
         ncols=4,
         figure=fig,
-        height_ratios=[1.0] * len(levels) + [0.6],
-        hspace=0.15,
-        wspace=0.05,
+        height_ratios=[1.0] * nmap + [1.15],
+        hspace=0.10,
+        wspace=0.06,
     )
 
     axes = np.empty((nrows, 4), dtype=object)
-
-    for i in range(len(levels)):
+    for i in range(nmap):
         for j in range(4):
             axes[i, j] = fig.add_subplot(gs[i, j], projection=proj)
-
     for j in range(4):
-        axes[nrows - 1, j] = fig.add_subplot(gs[nrows - 1, j])
+        axes[nmap, j] = fig.add_subplot(gs[nmap, j])
 
     # ----------------------------
     # Color scales
     # ----------------------------
-    Nmin, Nmax = 10, 1000
-    log_norm = mcolors.LogNorm(vmin=Nmin, vmax=Nmax)
-    shk = 0.4
+    Nmin = max(10.0, minN)
+    Nmax = 1000.0
+    nd_norm = mcolors.LogNorm(vmin=Nmin, vmax=Nmax)
+    diff_norm = mcolors.TwoSlopeNorm(vmin=-100.0, vcenter=0.0, vmax=100.0)
+    rms_norm = mcolors.Normalize(vmin=0.0, vmax=100.0, clip=True)
+
+    col_titles = [
+        "Base",
+        "NDnet",
+        "NDnet - Base",
+        "RMS difference",
+    ]
+    cmaps = ["turbo", "turbo", "RdBu_r", "viridis"]
+    norms = [nd_norm, nd_norm, diff_norm, rms_norm]
+    cbar_labels = [
+        r"$N_d$ (cm$^{-3}$)",
+        r"$N_d$ (cm$^{-3}$)",
+        "Difference (%)",
+        "RMS difference (%)",
+    ]
+
+    # Weighted global mean for concise right-side panel annotation.
+    def _global_mean(da):
+        if "lat" in da.coords:
+            w = np.cos(np.deg2rad(da["lat"]))
+            return float(da.weighted(w).mean(("lat", "lon"), skipna=True).values)
+        return float(da.mean(("lat", "lon"), skipna=True).values)
+
+    panel_index = 0
+    mappables = [None] * 4
 
     # ----------------------------
     # Map panels
     # ----------------------------
-    for i, lev in enumerate(levels):
+    for i, lev in enumerate(levels_plot):
+        base_slice = avg_base.sel(lev=lev, method="nearest")
+        nn_slice = avg_nn.sel(lev=lev, method="nearest")
+        diff_slice = avg_diff.sel(lev=lev, method="nearest")
+        rms_slice = rms_3d.sel(lev=lev, method="nearest")
 
-        base_slice = avg_base.sel(lev=lev)
-        nn_slice   = avg_nn.sel(lev=lev)
-        diff_slice = avg_diff.sel(lev=lev)
-        rms_slice  = rms_3d.sel(lev=lev)
+        actual_lev = float(base_slice["lev"].values)
+        panel_data = [base_slice, nn_slice, diff_slice, rms_slice]
 
-        panels = [
-            (base_slice, "Base", "turbo", log_norm),
-            (nn_slice,   "NN",   "turbo", log_norm),
-            (diff_slice, "% NN-Base", "RdBu_r", None),
-            (rms_slice,  "RMS Error", "RdBu_r", None),
-        ]
-
-        for ax, (da, title, cmap, norm) in zip(axes[i], panels):
+        for j, (ax, da) in enumerate(zip(axes[i], panel_data)):
             im = da.plot.pcolormesh(
                 ax=ax,
                 transform=proj,
-                cmap=cmap,
-                norm=norm,
-                vmin=-100 if "NN-Base" in title else (0 if "RMS" in title else None),
-                vmax=100  if "NN-Base" in title else (1 if "RMS" in title else None),
+                cmap=cmaps[j],
+                norm=norms[j],
                 add_colorbar=False,
             )
+            mappables[j] = im
 
-            ax.coastlines()
-            ax.add_feature(cfeature.BORDERS, linewidth=0.5)
-            ax.set_title(f"{title} @ {lev} hPa")
-            fig.colorbar(im, ax=ax, shrink=shk)
+            ax.coastlines(linewidth=0.6)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.35)
+            ax.set_global()
 
-    # ----------------------------
-    # Zonal diagnostics
-    # ----------------------------
-    row = len(levels)
+            # Keep tick marks on every map but avoid repeated interior labels.
+            xticks = [-120, -60, 0, 60, 120]
+            yticks = [-60, -30, 0, 30, 60]
+            ax.set_xticks(xticks, crs=proj)
+            ax.set_yticks(yticks, crs=proj)
+            ax.tick_params(axis="both", which="major", labelsize=7, length=2.5)
+            if i < nmap - 1:
+                ax.set_xticklabels([])
+            if j > 0:
+                ax.set_yticklabels([])
+            ax.set_xlabel("")
+            ax.set_ylabel("")
 
-    zonal_base = avg_base.mean(dim="lon", skipna=True)
-    zonal_nn   = avg_nn.mean(dim="lon", skipna=True)
-    zonal_diff = 100.0 * (zonal_nn - zonal_base) / np.clip(zonal_base, 0.1, None)
-
-    zonal_rms = 100.0 * np.sqrt(
-        ((zonal_nn - zonal_base) ** 2)
-    ) / zonal_base.where(zonal_base > minN)
-
-    ZB = np.clip(zonal_base.values, Nmin, None)
-    ZN = np.clip(zonal_nn.values, Nmin, None)
-    ZD = zonal_diff.values
-    ZR = zonal_rms.values
-
-    p_lev = Nd_mean.lev.values
-    p_ticks = np.array([1000, 850, 700, 500, 300, 200])
-    yticks = [np.argmin(np.abs(p_lev - p)) for p in p_ticks]
-    ylabels = [str(int(p)) for p in p_ticks]
-
-    zonal_panels = [
-            (ZB, "Zonal Mean (Base)", "turbo", log_norm),
-            (ZN, "Zonal Mean (NN)", "turbo", log_norm),
-            (ZD, "% Difference (Zonal)", "RdBu_r", None),
-            (ZR, "RMS Error (Zonal)", "RdBu_r", None),
-        ]
-
-
-    for ax, (Z, title, cmap, norm) in zip(axes[row], zonal_panels):
-        im = ax.imshow(
-                Z,
-                aspect="auto",
-                cmap=cmap,
-                norm=norm,
-                vmin=-100 if "Difference" in title else (0 if "RMS" in title else None),
-                vmax=100  if "Difference" in title else (1 if "RMS" in title else None),
+            letter = chr(ord("a") + panel_index)
+            panel_index += 1
+            ax.set_title(
+                f"({letter}) {actual_lev:.0f} hPa",
+                loc="left",
+                fontsize=9,
+                pad=3,
             )
 
+            gmean = _global_mean(da)
+            if j < 2:
+                right = rf"$\overline{{N_d}}$={gmean:.0f}"
+            else:
+                right = f"mean={gmean:.1f}%"
+            ax.set_title(right, loc="right", fontsize=8.5, pad=3)
 
-    axes[row, 0].set_ylabel("Pressure (hPa)")
+            if i == 0:
+                ax.set_title(
+                    col_titles[j],
+                    loc="center",
+                    fontsize=10.5,
+                    fontweight="bold",
+                    pad=16,
+                )
 
     # ----------------------------
-    # Save
+    # Zonal diagnostics, using actual pressure coordinates
     # ----------------------------
-    plt.savefig(out_png, dpi=120, bbox_inches="tight")
+    row = nmap
+
+    zonal_base = avg_base.mean(dim="lon", skipna=True).transpose("lev", "lat")
+    zonal_nn = avg_nn.mean(dim="lon", skipna=True).transpose("lev", "lat")
+    zonal_denom = zonal_base.where(zonal_base >= minN)
+    zonal_diff = 100.0 * (zonal_nn - zonal_base) / zonal_denom
+    zonal_rms = 100.0 * np.sqrt((zonal_nn - zonal_base) ** 2) / zonal_denom
+
+    zonal_panels = [zonal_base, zonal_nn, zonal_diff, zonal_rms]
+    lat_vals = np.asarray(zonal_base["lat"].values, dtype=float)
+    lev_vals = np.asarray(zonal_base["lev"].values, dtype=float)
+
+    p_lo = float(np.nanmin(lev_vals))
+    p_hi = float(np.nanmax(lev_vals))
+    standard_p_ticks = np.array([1000, 900, 800, 700, 600, 500, 400, 300, 200])
+    p_ticks = standard_p_ticks[(standard_p_ticks >= p_lo) & (standard_p_ticks <= p_hi)]
+
+    for j, (ax, da) in enumerate(zip(axes[row], zonal_panels)):
+        im = ax.pcolormesh(
+            lat_vals,
+            lev_vals,
+            da.values,
+            shading="auto",
+            cmap=cmaps[j],
+            norm=norms[j],
+        )
+        mappables[j] = im
+
+        # Pressure increases downward: high altitude at top, surfaceward at bottom.
+        ax.set_ylim(p_hi, p_lo)
+        ax.set_yticks(p_ticks)
+        ax.set_xlim(float(np.nanmin(lat_vals)), float(np.nanmax(lat_vals)))
+        ax.set_xticks([-90, -60, -30, 0, 30, 60, 90])
+        ax.tick_params(axis="both", labelsize=8, direction="out", length=3)
+        ax.grid(False)
+        ax.set_xlabel("Latitude (°)", fontsize=9)
+
+        if j == 0:
+            ax.set_ylabel("Pressure (hPa)", fontsize=9)
+        else:
+            ax.set_ylabel("")
+            ax.set_yticklabels([])
+
+        letter = chr(ord("a") + panel_index)
+        panel_index += 1
+        ax.set_title(f"({letter}) Zonal mean", loc="left", fontsize=9, pad=3)
+
+    # One compact colorbar per column, shared by map and zonal panels.
+    for j in range(4):
+        cb = fig.colorbar(
+            mappables[j],
+            ax=list(axes[:, j]),
+            orientation="horizontal",
+            fraction=0.025,
+            pad=0.045,
+            aspect=35,
+        )
+        cb.set_label(cbar_labels[j], fontsize=9)
+        cb.ax.tick_params(labelsize=8)
+
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -308,7 +407,7 @@ def plot_global_level_sigma_inference(
     else:
         vmin, vmax = minSig, minSig * 10.0
 
-    vmin =  10
+    vmin = 10
     vmax = 1000
     log_norm = mcolors.LogNorm(vmin=vmin, vmax=vmax)
     shk = 0.55
@@ -374,12 +473,10 @@ def plot_global_level_sigma_inference(
     plt.close(fig)
 
 
-
 # ============================================================
 # Campaign scatter diagnostics
 # Append to plotting.py
 # ============================================================
-
 
 
 def _campaign_layout_for_n(n):
@@ -644,11 +741,9 @@ def plot_campaign_scatter_panels(
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[WROTE] {out_png}")
-    
-    
-    
-    
- ###########################################################
+
+
+###########################################################
 def plot_global_level_sigma_rel_inference(
     sigmaNd_nn,     # xr.DataArray (time, lev, lat, lon)
     Nd_nn,          # xr.DataArray (time, lev, lat, lon)
@@ -879,4 +974,4 @@ def plot_global_level_sigma_rel_inference(
         bbox_inches="tight",
     )
 
-    plt.close(fig)   
+    plt.close(fig)
