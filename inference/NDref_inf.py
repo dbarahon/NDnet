@@ -112,6 +112,8 @@ if __name__ == "__main__":
         f"[TAPER] mode={taper_mode} start={taper_start_hpa:g} hPa "
         f"top={taper_top_hpa:g} hPa"
     )
+    if taper_mode == "base":
+        print("[TAPER] refined NN departs smoothly back to the reanalysis-emulation base aloft")
     
     in_channels = 4
     model = build_model(in_channels, numgpu, device)
@@ -192,8 +194,8 @@ if __name__ == "__main__":
 
         coeffs_resid_nn, sig = run_infer_x_mu0(device, test_loader, model)  # numpy (T,M,lat,lon)
 
-        # absolute coeffs = residual + Amean
-        coeffs_abs_nn   = coeffs_resid_nn + Amean4               # numpy (T,M,lat,lon)
+        # absolute NN coeffs = residual + Amean
+        coeffs_abs_nn = coeffs_resid_nn + Amean4
 
         # daskify NN coeffs (+ sigma)
         coeffs_abs_nn_da = da.from_array(coeffs_abs_nn.astype(np.float32), chunks=(64, -1, -1, -1))
@@ -205,7 +207,7 @@ if __name__ == "__main__":
         lon_coord  = Ares_base["lon"]
 
         # reconstruct Nd globally + sigmaNd for NN
-        ds_nn = reconstruct_Nd_from_coeffs_chunked(
+        ds_nn_raw = reconstruct_Nd_from_coeffs_chunked(
             coeffs_abs_nn_da,
             EOF,
             Nd_mean,
@@ -216,17 +218,40 @@ if __name__ == "__main__":
             chunk_t=64,
         )
 
-        # Keep literal EOF reconstruction available for optional diagnostics,
-        # but use the tapered fields as the final product.
-        Nd_raw = ds_nn["Nd_rec"].rename("NDinc_cf01p_raw")
-        sigma_raw = ds_nn["sigmaNd_rec"].rename("sigmaNd_raw")
+        Nd_raw = ds_nn_raw["Nd_rec"].rename("NDinc_cf01p_raw")
+        sigma_raw = ds_nn_raw["sigmaNd_rec"].rename("sigmaNd_raw")
 
+        # --------------------------------------------------
+        # Optional physically based target for mode="base".
+        # Ares_base is the residual-coefficient field from the
+        # reanalysis emulation and is NOT modified by the taper.
+        # --------------------------------------------------
+        Nd_base = None
+        if taper_mode == "base":
+            coeffs_abs_base = Ares_base.values.astype(np.float32) + Amean4
+            coeffs_abs_base_da = da.from_array(
+                coeffs_abs_base.astype(np.float32),
+                chunks=(64, -1, -1, -1),
+            )
+            Nd_base = reconstruct_Nd_from_coeffs_chunked(
+                coeffs_abs_base_da,
+                EOF,
+                Nd_mean,
+                time_coord,
+                lat_coord,
+                lon_coord,
+                chunk_t=64,
+            )["Nd_rec"].rename("NDinc_cf01p_base")
+
+        # Final product. In base mode:
+        #   Nd_final = Nd_base + T * (Nd_raw - Nd_base)
         Nd_final = apply_nd_pressure_taper(
             Nd_raw,
             Nd_mean=Nd_mean,
             mode=taper_mode,
             p_start=taper_start_hpa,
             p_top=taper_top_hpa,
+            base_nd=Nd_base,
             name="NDinc_cf01p",
         )
         sigma_final = apply_sigma_pressure_taper(
@@ -241,6 +266,8 @@ if __name__ == "__main__":
         if SAVE_RAW_TAPER_FIELDS:
             ds_nn["Nd_rec_raw"] = Nd_raw
             ds_nn["sigmaNd_rec_raw"] = sigma_raw
+            if Nd_base is not None:
+                ds_nn["Nd_base"] = Nd_base
 
         
         # --------------------------------------------------
@@ -295,11 +322,14 @@ if __name__ == "__main__":
         if SAVE_RAW_TAPER_FIELDS:
             out["NDinc_cf01p_raw"] = ds_nn["Nd_rec_raw"].assign_coords(time=tcoord)
             out["sigmaNd_raw"] = ds_nn["sigmaNd_rec_raw"].assign_coords(time=tcoord)
+            if "Nd_base" in ds_nn:
+                out["NDinc_cf01p_base"] = ds_nn["Nd_base"].assign_coords(time=tcoord)
 
         out.attrs.update(
             upper_taper_mode=taper_mode,
             upper_taper_start_hpa=taper_start_hpa,
             upper_taper_top_hpa=taper_top_hpa,
+            upper_taper_base_unchanged=True,
         )
 
         out = out.chunk({"time": 1})
