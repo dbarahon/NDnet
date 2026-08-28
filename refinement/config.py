@@ -38,6 +38,13 @@ if deb > 0:
 sitemaskmode = "obs_dates" # "obs_levels" | "obs_dates" | "none" makes little difference, use dates though
 
 # -------------------------------------------------
+# Plotting thresholds
+# -------------------------------------------------
+# Minimum Nd retained by the global Nd comparison diagnostic. Keeping this in
+# config makes taper experiments directly comparable without editing plotting.py.
+MIN_ND = 1.0
+
+# -------------------------------------------------
 # Post-inference upper-pressure taper
 # -------------------------------------------------
 # Options:
