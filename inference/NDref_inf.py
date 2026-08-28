@@ -4,6 +4,7 @@ from utils import *
 from NN_construct import *
 from train_infer import *
 from plotting import plot_global_level_comparison, plot_vertical_profiles_sites, plot_global_level_sigma_inference
+from profile_taper import apply_nd_pressure_taper, apply_sigma_pressure_taper, normalize_taper_mode
 
 import numpy as np
 import xarray as xr
@@ -103,6 +104,14 @@ if __name__ == "__main__":
     numwork = 0
 
     print("Using DataParallel on", numgpu, "GPUs")
+
+    taper_mode = normalize_taper_mode(UPPER_TAPER_MODE)
+    taper_start_hpa = float(UPPER_TAPER_START_HPA)
+    taper_top_hpa = float(UPPER_TAPER_TOP_HPA)
+    print(
+        f"[TAPER] mode={taper_mode} start={taper_start_hpa:g} hPa "
+        f"top={taper_top_hpa:g} hPa"
+    )
     
     in_channels = 4
     model = build_model(in_channels, numgpu, device)
@@ -207,6 +216,32 @@ if __name__ == "__main__":
             chunk_t=64,
         )
 
+        # Keep literal EOF reconstruction available for optional diagnostics,
+        # but use the tapered fields as the final product.
+        Nd_raw = ds_nn["Nd_rec"].rename("NDinc_cf01p_raw")
+        sigma_raw = ds_nn["sigmaNd_rec"].rename("sigmaNd_raw")
+
+        Nd_final = apply_nd_pressure_taper(
+            Nd_raw,
+            Nd_mean=Nd_mean,
+            mode=taper_mode,
+            p_start=taper_start_hpa,
+            p_top=taper_top_hpa,
+            name="NDinc_cf01p",
+        )
+        sigma_final = apply_sigma_pressure_taper(
+            sigma_raw,
+            mode=taper_mode,
+            p_start=taper_start_hpa,
+            p_top=taper_top_hpa,
+            name="sigmaNd",
+        )
+
+        ds_nn = xr.Dataset({"Nd_rec": Nd_final, "sigmaNd_rec": sigma_final})
+        if SAVE_RAW_TAPER_FIELDS:
+            ds_nn["Nd_rec_raw"] = Nd_raw
+            ds_nn["sigmaNd_rec_raw"] = sigma_raw
+
         
         # --------------------------------------------------
         # Surface-pressure mask (p > Ps) MERRA
@@ -256,6 +291,15 @@ if __name__ == "__main__":
                 "a_resid_pred": a_resid_da,
                 "a_abs_pred": a_abs_da,
             }
+        )
+        if SAVE_RAW_TAPER_FIELDS:
+            out["NDinc_cf01p_raw"] = ds_nn["Nd_rec_raw"].assign_coords(time=tcoord)
+            out["sigmaNd_raw"] = ds_nn["sigmaNd_rec_raw"].assign_coords(time=tcoord)
+
+        out.attrs.update(
+            upper_taper_mode=taper_mode,
+            upper_taper_start_hpa=taper_start_hpa,
+            upper_taper_top_hpa=taper_top_hpa,
         )
 
         out = out.chunk({"time": 1})
