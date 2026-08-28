@@ -1,6 +1,6 @@
 """Evaluation-only site and campaign diagnostics for refinement.
 
-This module is used when ``config.do_train`` is False.  It never configures an
+This module is used when ``config.do_train`` is False. It never configures an
 optimizer and never calls ``training_val`` or ``configure_training_stage``.
 The trained refinement model is loaded from ``./<MODEL_NAME>_weights.pt`` and
 used in eval mode for site/campaign diagnostics.
@@ -30,14 +30,15 @@ from config import (
     vars_out,
 )
 from campaign import (
+    EOFNdMultiObsDatasetTorch,
     load_campaign_training_files,
+    make_multiobs_collate_fn,
     sample_campaign_from_dense_predictions,
     tensorize_campaign_inputs_from_existing,
 )
 from data_handling import (
     A_sites_from_Ares_base,
     A_sites_from_infer_grid,
-    EOFNdMultiObsDatasetTorch,
     get_data,
     reconstruct_Nd_from_A_sites,
     tensorize_sites_inputs_v2,
@@ -49,7 +50,7 @@ from utils import make_canonical_da, safe_to_netcdf
 
 
 def _load_eval_data():
-    """Load the full site/campaign evaluation window without training split."""
+    """Load the full site/campaign evaluation window without a training split."""
     Nin_2d, A_sites, Nd_sites, Err_sites, Ares_base, site_meta = get_data(
         vars_out=vars_out,
         pth_all=pth_all,
@@ -105,6 +106,8 @@ def _load_eval_data():
         time_idx=all_idx,
     )
 
+    # Match the existing post-training inference path exactly: no campaign
+    # augmentation and the same ragged-segment collator.
     full_loader = DataLoader(
         full_ds,
         batch_size=hp["batch_sz"],
@@ -112,6 +115,11 @@ def _load_eval_data():
         num_workers=0,
         pin_memory=True,
         drop_last=False,
+        collate_fn=make_multiobs_collate_fn(
+            use_campaign_aug=False,
+            aug_mode="none",
+            seed=1234,
+        ),
     )
 
     return {
@@ -127,7 +135,7 @@ def _load_eval_data():
 
 
 def _load_frozen_model(Nin_2d, device, numgpu):
-    """Build architecture and load the already-trained local checkpoint."""
+    """Build the architecture and load the already-trained local checkpoint."""
     in_channels = len(list(Nin_2d.data_vars))
     model = build_model(in_channels, numgpu, device, hp)
     run_model_name = active_model_name(hp)
@@ -240,42 +248,67 @@ def _run_site_diagnostics(state, coeffs_resid_nn, sig_grid):
     dsS = xr.Dataset(
         {
             "Nd_true": make_canonical_da(
-                Nd_true, name="Nd_true", dims=("time", "lev", "site"),
-                ref_coords=ref_coords, dtype=np.float32,
+                Nd_true,
+                name="Nd_true",
+                dims=("time", "lev", "site"),
+                ref_coords=ref_coords,
+                dtype=np.float32,
             ),
             "Nd_base": make_canonical_da(
-                Nd_base_tls, name="Nd_base", dims=("time", "lev", "site"),
-                ref_coords=ref_coords, dtype=np.float32,
+                Nd_base_tls,
+                name="Nd_base",
+                dims=("time", "lev", "site"),
+                ref_coords=ref_coords,
+                dtype=np.float32,
             ),
             "Nd_rec": make_canonical_da(
-                Nd_rec_tls, name="Nd_rec", dims=("time", "lev", "site"),
-                ref_coords=ref_coords, dtype=np.float32,
+                Nd_rec_tls,
+                name="Nd_rec",
+                dims=("time", "lev", "site"),
+                ref_coords=ref_coords,
+                dtype=np.float32,
             ),
             "site_mask": make_canonical_da(
-                site_mask, name="site_mask", dims=("time", "site"),
-                ref_coords=ref_coords, dtype="uint8",
+                site_mask,
+                name="site_mask",
+                dims=("time", "site"),
+                ref_coords=ref_coords,
+                dtype="uint8",
             ),
             "A_sites_resid": make_canonical_da(
-                A_sites_resid, name="A_sites_resid", dims=("time", "mode", "site"),
-                ref_coords=ref_coords, dtype=np.float32,
+                A_sites_resid,
+                name="A_sites_resid",
+                dims=("time", "mode", "site"),
+                ref_coords=ref_coords,
+                dtype=np.float32,
             ),
             "A_base_sites_resid": make_canonical_da(
-                A_base_sites_resid, name="A_base_sites_resid",
-                dims=("time", "mode", "site"), ref_coords=ref_coords,
+                A_base_sites_resid,
+                name="A_base_sites_resid",
+                dims=("time", "mode", "site"),
+                ref_coords=ref_coords,
                 dtype=np.float32,
             ),
             "A_sites_abs": make_canonical_da(
-                A_abs_sites, name="A_sites_abs", dims=("time", "mode", "site"),
-                ref_coords=ref_coords, dtype=np.float32,
+                A_abs_sites,
+                name="A_sites_abs",
+                dims=("time", "mode", "site"),
+                ref_coords=ref_coords,
+                dtype=np.float32,
             ),
             "A_base_sites_abs": make_canonical_da(
-                A_base_abs_sites, name="A_base_sites_abs",
-                dims=("time", "mode", "site"), ref_coords=ref_coords,
+                A_base_abs_sites,
+                name="A_base_sites_abs",
+                dims=("time", "mode", "site"),
+                ref_coords=ref_coords,
                 dtype=np.float32,
             ),
             "A_mean_sites": make_canonical_da(
-                A_mean_sites, name="A_mean_sites", dims=("mode", "site"),
-                ref_coords=ref_coords, dtype=np.float32,
+                A_mean_sites,
+                name="A_mean_sites",
+                dims=("mode", "site"),
+                ref_coords=ref_coords,
+                dtype=np.float32,
             ),
         }
     )
@@ -289,7 +322,16 @@ def _run_site_diagnostics(state, coeffs_resid_nn, sig_grid):
             dtype=np.float32,
         )
 
-    for c in ["ilat", "ilon", "site_lat", "site_lon", "obs_lat", "obs_lon", "file_lat", "file_lon"]:
+    for c in [
+        "ilat",
+        "ilon",
+        "site_lat",
+        "site_lon",
+        "obs_lat",
+        "obs_lon",
+        "file_lat",
+        "file_lon",
+    ]:
         if c in site_meta:
             dsS = dsS.assign_coords({c: ("site", site_meta[c].values)})
 
