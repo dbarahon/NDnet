@@ -14,7 +14,7 @@ MODEL_NAME = "NDnet_EOFcoeff_sigmaFT"
 BASEROOT = "/panfs/ccds02/nobackup/people/dbarahon/NDnet/EOF/in_cloudM2/best/"
 
 
-do_train = True
+do_train = False
 do_sites = True
 do_campaigns = True
 do_test = True
@@ -36,6 +36,22 @@ if deb > 0:
     print_every = 10
 
 sitemaskmode = "obs_dates" # "obs_levels" | "obs_dates" | "none" makes little difference, use dates though
+
+# -------------------------------------------------
+# Fast repeated site/campaign diagnostics
+# -------------------------------------------------
+# The first evaluation run computes the raw (untapered) site/campaign products
+# and stores them here. Subsequent taper experiments reuse those small files,
+# so the model, site projection, and dense diagnostic inference are skipped.
+# Cache validity includes MODEL_NAME weights, EOF/base files, prefixes, and
+# relevant diagnostic settings; stale caches are rejected automatically.
+REUSE_DIAGNOSTIC_CACHE = True
+WRITE_DIAGNOSTIC_CACHE = True
+DIAGNOSTIC_CACHE_DIR = "./cache/diagnostics"
+
+# On a cache miss, run the dense NN only on the union of days required by the
+# requested site/campaign diagnostics. Set False for the legacy all-day pass.
+SPARSE_DIAGNOSTIC_INFERENCE = True
 
 # -------------------------------------------------
 # Plotting thresholds
