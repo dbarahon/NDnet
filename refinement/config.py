@@ -29,6 +29,20 @@ if deb > 0:
 
 sitemaskmode = "obs_dates" # "obs_levels" | "obs_dates" | "none" makes little difference, use dates though
 
+# -------------------------------------------------
+# Post-inference upper-pressure taper
+# -------------------------------------------------
+# Options:
+#   "none"        -> original EOF reconstruction
+#   "climatology" -> taper only Nd anomaly to zero aloft
+#   "zero"        -> taper total Nd to zero aloft
+#
+# The trained model and inferred EOF coefficients are unchanged.
+UPPER_TAPER_MODE = "climatology"
+UPPER_TAPER_START_HPA = 500.0
+UPPER_TAPER_TOP_HPA = 350.0
+SAVE_RAW_TAPER_FIELDS = True
+
 
 hp = {
     "nepochs": 3000,
