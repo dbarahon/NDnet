@@ -11,6 +11,14 @@ from profile_taper import (
     apply_sigma_pressure_taper,
     normalize_taper_mode,
 )
+from diagnostic_cache import (
+    diagnostic_cache_valid,
+    diagnostic_time_indices,
+    load_diagnostic_cache,
+    remap_campaign_bundle_for_sparse,
+    sample_sites_from_sparse_grid,
+    write_diagnostic_cache,
+)
 
 import numpy as np
 import xarray as xr
@@ -244,8 +252,8 @@ def finalize_nd_product(
     return ds
 
 
-def load_site_campaign_state():
-    """Load the common site/campaign evaluation and training window once."""
+def load_site_campaign_state(need_campaign_bundle=False):
+    """Load the common site/campaign data only when a raw cache is unavailable."""
     Nin_2d, A_sites, Nd_sites, Err_sites, Ares_base, site_meta = get_data(
         vars_out=vars_out,
         pth_all=pth_all,
@@ -275,9 +283,8 @@ def load_site_campaign_state():
     camp_bundle = None
     campaign_train_dir = getattr(cfg, "CAMPAIGN_TRAIN_DIR", None)
     campaign_pattern = getattr(cfg, "CAMPAIGN_PATTERN", "*_training.nc")
-    need_campaign_bundle = bool(campaign_train_dir) and (do_train or do_campaigns)
 
-    if need_campaign_bundle:
+    if need_campaign_bundle and campaign_train_dir:
         campaign_ds = load_campaign_training_files(
             campaign_train_dir=campaign_train_dir,
             template_time=Ares_base["time"].values,
@@ -310,7 +317,11 @@ def load_site_campaign_state():
     }
 
 
-def make_full_loader(state):
+def make_full_loader(state, time_idx=None):
+    if time_idx is None:
+        time_idx = state["all_idx"]
+    time_idx = np.asarray(time_idx, dtype=np.int64)
+
     full_ds = EOFNdMultiObsDatasetTorch(
         X2d_t=state["X2d_t"],
         MU0_t=state["MU0_t"],
@@ -319,7 +330,7 @@ def make_full_loader(state):
         Nds_t=state["Nds"],
         Eds_t=state["Eds"],
         campaign_bundle=state["camp_bundle"],
-        time_idx=state["all_idx"],
+        time_idx=time_idx,
     )
     return DataLoader(
         full_ds,
@@ -505,21 +516,66 @@ def load_frozen_model(state, device, numgpu, model_name):
     return model
 
 
-def dense_inference_for_diagnostics(state, model, device):
+def dense_inference_for_diagnostics(
+    state,
+    model,
+    device,
+    *,
+    need_sites,
+    need_campaigns,
+):
+    infer_idx = diagnostic_time_indices(
+        all_idx=state["all_idx"],
+        VS_t=state["VS_t"],
+        campaign_bundle=state["camp_bundle"],
+        need_sites=need_sites,
+        need_campaigns=need_campaigns,
+    )
+    if infer_idx.size == 0:
+        raise RuntimeError("No site/campaign days selected for diagnostic inference")
+
     if bypass_infer:
         print("===== ByPassing Inference: using base residual coefficients =====")
-        return state["Ares_base"].values.astype(np.float32), None
+        coeffs = state["Ares_base"].isel(time=infer_idx).values.astype(np.float32)
+        return coeffs, None, infer_idx
 
     model.eval()
-    full_loader = make_full_loader(state)
+    loader = make_full_loader(state, time_idx=infer_idx)
     with torch.no_grad():
-        return run_infer_x_mu0(device, full_loader, model)
+        coeffs, sig = run_infer_x_mu0(device, loader, model)
+    return coeffs, sig, infer_idx
 
 
-def run_site_diagnostics(state, coeffs_resid_nn, sig_grid):
-    if not do_sites:
-        return
+def render_site_diagnostics(dsS_raw):
+    """Apply current taper to an untapered site dataset, then write and plot."""
+    dsS = dsS_raw.copy(deep=False)
+    dsS = finalize_nd_product(
+        dsS,
+        nd_name="Nd_rec",
+        base_name="Nd_base",
+        raw_nd_name="Nd_rec_raw",
+    )
+    safe_to_netcdf(dsS, "NDnet_site_test.nc")
+    print("[WRITE] NDnet_site_test.nc")
 
+    with xr.open_dataset("NDnet_site_test.nc") as dsS_plot:
+        plot_vertical_profiles_sites(
+            Nd_true_s=dsS_plot["Nd_true"],
+            Nd_base_s=dsS_plot["Nd_base"],
+            Nd_nn_s=dsS_plot["Nd_rec"].transpose("lev", "time", "site"),
+            out_png="NDnet_site_profiles.png",
+            min_samples=5,
+        )
+    print("[PLOT] NDnet_site_profiles.png")
+
+
+def run_site_diagnostics(
+    state,
+    coeffs_resid_nn,
+    sig_grid,
+    infer_idx,
+    model_name,
+):
     print("=========== site evaluation ===========")
     Nd_sites = state["Nd_sites"]
     A_sites = state["A_sites"]
@@ -538,11 +594,12 @@ def run_site_diagnostics(state, coeffs_resid_nn, sig_grid):
         A_sites_resid = A_sites.rename("A_sites_resid")
         sig_sites = None
     else:
-        A_sites_resid, sig_sites = A_sites_from_infer_grid(
+        A_sites_resid, sig_sites = sample_sites_from_sparse_grid(
             coeffs_resid_nn=coeffs_resid_nn,
             sig_grid=sig_grid,
+            infer_idx=infer_idx,
             site_meta=site_meta,
-            time_coord=Nd_true["time"],
+            full_time_coord=Nd_true["time"],
             mode_coord=Ares_base["mode"].values,
         )
 
@@ -585,7 +642,7 @@ def run_site_diagnostics(state, coeffs_resid_nn, sig_grid):
         "mode": A_sites_resid["mode"],
     }
 
-    dsS = xr.Dataset(
+    dsS_raw = xr.Dataset(
         {
             "Nd_true": make_canonical_da(
                 Nd_true, name="Nd_true", dims=("time", "lev", "site"),
@@ -627,7 +684,7 @@ def run_site_diagnostics(state, coeffs_resid_nn, sig_grid):
     )
 
     if sig_sites is not None:
-        dsS["sigma_sites"] = make_canonical_da(
+        dsS_raw["sigma_sites"] = make_canonical_da(
             sig_sites, name="sigma_sites", dims=("time", "mode", "site"),
             ref_coords=ref_coords, dtype=np.float32,
         )
@@ -637,86 +694,17 @@ def run_site_diagnostics(state, coeffs_resid_nn, sig_grid):
         "obs_lat", "obs_lon", "file_lat", "file_lon",
     ]:
         if c in site_meta:
-            dsS = dsS.assign_coords({c: ("site", site_meta[c].values)})
+            dsS_raw = dsS_raw.assign_coords({c: ("site", site_meta[c].values)})
 
-    dsS = finalize_nd_product(
-        dsS,
-        nd_name="Nd_rec",
-        base_name="Nd_base",
-        raw_nd_name="Nd_rec_raw",
-    )
-    safe_to_netcdf(dsS, "NDnet_site_test.nc")
-    print("[WRITE] NDnet_site_test.nc")
-
-    with xr.open_dataset("NDnet_site_test.nc") as dsS_plot:
-        plot_vertical_profiles_sites(
-            Nd_true_s=dsS_plot["Nd_true"],
-            Nd_base_s=dsS_plot["Nd_base"],
-            Nd_nn_s=dsS_plot["Nd_rec"].transpose("lev", "time", "site"),
-            out_png="NDnet_site_profiles.png",
-            min_samples=5,
-        )
-    print("[PLOT] NDnet_site_profiles.png")
+    dsS_raw.attrs["diagnostic_inference_days"] = int(len(infer_idx))
+    dsS_raw.attrs["diagnostic_total_days"] = int(len(state["all_idx"]))
+    write_diagnostic_cache(dsS_raw, "site", model_name)
+    render_site_diagnostics(dsS_raw)
 
 
-def run_campaign_diagnostics(state, coeffs_resid_nn, sig_grid):
-    if not do_campaigns:
-        return
-
-    camp_bundle = state["camp_bundle"]
-    campaign_ds = state["campaign_ds"]
-    if camp_bundle is None:
-        print("[INFO] do_campaigns=True but no campaign bundle is loaded; skipping")
-        return
-
-    print("=========== campaign evaluation ===========")
-    dsC_nn = sample_campaign_from_dense_predictions(
-        coeffs_resid_nn=coeffs_resid_nn,
-        sigma_grid=sig_grid,
-        bundle=camp_bundle,
-        EOF=EOF,
-        Nd_mean=Nd_mean,
-        A_mean=A_mean,
-    )
-    dsC_base = sample_campaign_from_dense_predictions(
-        coeffs_resid_nn=state["Ares_base"].values.astype(np.float32),
-        sigma_grid=None,
-        bundle=camp_bundle,
-        EOF=EOF,
-        Nd_mean=Nd_mean,
-        A_mean=A_mean,
-    )
-
-    dsC = xr.Dataset(
-        {
-            "Nd_obs": dsC_nn["Nd_obs_mean"].astype(np.float32),
-            "Nd_nn": dsC_nn["Nd_model"].astype(np.float32),
-            "Nd_base": dsC_base["Nd_model"].astype(np.float32),
-            "p_merra": dsC_nn["p_merra"].astype(np.float32),
-            "time_idx": dsC_nn["time_idx"].astype(np.int64),
-            "flight_id": dsC_nn["flight_id"].astype(np.int64),
-            "segment_gid": dsC_nn["segment_gid"].astype(np.int64),
-            "A_nn_resid": dsC_nn["A_seg_resid"].astype(np.float32),
-            "A_nn_abs": dsC_nn["A_seg_abs"].astype(np.float32),
-            "A_base_resid": dsC_base["A_seg_resid"].astype(np.float32),
-            "A_base_abs": dsC_base["A_seg_abs"].astype(np.float32),
-        }
-    )
-
-    if "sigma_model" in dsC_nn:
-        dsC["sigma_nn"] = dsC_nn["sigma_model"].astype(np.float32)
-    if "day" in dsC_nn:
-        dsC["time"] = dsC_nn["day"]
-    if "campaign" in dsC_nn.coords:
-        dsC = dsC.assign_coords({"campaign": ("segment", dsC_nn["campaign"].values)})
-    if "campaign_id" in dsC_nn:
-        dsC["campaign_id"] = dsC_nn["campaign_id"].astype(np.int32)
-    if campaign_ds is not None and "modis_ok" in campaign_ds:
-        dsC["modis_ok"] = xr.DataArray(
-            campaign_ds["modis_ok"].values.astype(np.int8),
-            dims=("segment",),
-        )
-
+def render_campaign_diagnostics(dsC_raw):
+    """Apply current taper to an untapered campaign dataset, then write and plot."""
+    dsC = dsC_raw.copy(deep=False)
     dsC = finalize_nd_product(
         dsC,
         nd_name="Nd_nn",
@@ -745,12 +733,123 @@ def run_campaign_diagnostics(state, coeffs_resid_nn, sig_grid):
     print("[PLOT] NDnet_campaign_scatter.png")
 
 
-def run_site_campaign_diagnostics(state, model, device):
-    if not (do_sites or do_campaigns):
+def run_campaign_diagnostics(
+    state,
+    coeffs_resid_nn,
+    sig_grid,
+    infer_idx,
+    model_name,
+):
+    camp_bundle = state["camp_bundle"]
+    campaign_ds = state["campaign_ds"]
+    if camp_bundle is None:
+        print("[INFO] campaign diagnostics requested but no campaign bundle is loaded")
         return
-    coeffs_resid_nn, sig_grid = dense_inference_for_diagnostics(state, model, device)
-    run_site_diagnostics(state, coeffs_resid_nn, sig_grid)
-    run_campaign_diagnostics(state, coeffs_resid_nn, sig_grid)
+
+    print("=========== campaign evaluation ===========")
+
+    # The sparse NN arrays are indexed [0, K), while the campaign bundle keeps
+    # original full-period time indices. Remap a shallow bundle copy only for
+    # sampling; the original metadata and reported time_idx remain unchanged.
+    sparse_bundle = remap_campaign_bundle_for_sparse(camp_bundle, infer_idx)
+
+    dsC_nn = sample_campaign_from_dense_predictions(
+        coeffs_resid_nn=coeffs_resid_nn,
+        sigma_grid=sig_grid,
+        bundle=sparse_bundle,
+        EOF=EOF,
+        Nd_mean=Nd_mean,
+        A_mean=A_mean,
+    )
+
+    # Base is sampled from the same sparse set of required days. This changes
+    # no values; it only avoids materializing the full dense base period.
+    base_sparse = state["Ares_base"].isel(time=infer_idx).values.astype(np.float32)
+    dsC_base = sample_campaign_from_dense_predictions(
+        coeffs_resid_nn=base_sparse,
+        sigma_grid=None,
+        bundle=sparse_bundle,
+        EOF=EOF,
+        Nd_mean=Nd_mean,
+        A_mean=A_mean,
+    )
+
+    original_time_idx = camp_bundle.time_idx.detach().cpu().numpy().astype(np.int64)
+
+    dsC_raw = xr.Dataset(
+        {
+            "Nd_obs": dsC_nn["Nd_obs_mean"].astype(np.float32),
+            "Nd_nn": dsC_nn["Nd_model"].astype(np.float32),
+            "Nd_base": dsC_base["Nd_model"].astype(np.float32),
+            "p_merra": dsC_nn["p_merra"].astype(np.float32),
+            "time_idx": xr.DataArray(original_time_idx, dims=("segment",)),
+            "flight_id": dsC_nn["flight_id"].astype(np.int64),
+            "segment_gid": dsC_nn["segment_gid"].astype(np.int64),
+            "A_nn_resid": dsC_nn["A_seg_resid"].astype(np.float32),
+            "A_nn_abs": dsC_nn["A_seg_abs"].astype(np.float32),
+            "A_base_resid": dsC_base["A_seg_resid"].astype(np.float32),
+            "A_base_abs": dsC_base["A_seg_abs"].astype(np.float32),
+        }
+    )
+
+    if "sigma_model" in dsC_nn:
+        dsC_raw["sigma_nn"] = dsC_nn["sigma_model"].astype(np.float32)
+    if "day" in dsC_nn:
+        dsC_raw["time"] = dsC_nn["day"]
+    if "campaign" in dsC_nn.coords:
+        dsC_raw = dsC_raw.assign_coords(
+            {"campaign": ("segment", dsC_nn["campaign"].values)}
+        )
+    if "campaign_id" in dsC_nn:
+        dsC_raw["campaign_id"] = dsC_nn["campaign_id"].astype(np.int32)
+    if campaign_ds is not None and "modis_ok" in campaign_ds:
+        dsC_raw["modis_ok"] = xr.DataArray(
+            campaign_ds["modis_ok"].values.astype(np.int8),
+            dims=("segment",),
+        )
+
+    dsC_raw.attrs["diagnostic_inference_days"] = int(len(infer_idx))
+    dsC_raw.attrs["diagnostic_total_days"] = int(len(state["all_idx"]))
+    write_diagnostic_cache(dsC_raw, "campaign", model_name)
+    render_campaign_diagnostics(dsC_raw)
+
+
+def run_site_campaign_diagnostics(
+    state,
+    model,
+    device,
+    model_name,
+    *,
+    need_sites,
+    need_campaigns,
+):
+    if not (need_sites or need_campaigns):
+        return
+
+    coeffs_resid_nn, sig_grid, infer_idx = dense_inference_for_diagnostics(
+        state,
+        model,
+        device,
+        need_sites=need_sites,
+        need_campaigns=need_campaigns,
+    )
+
+    if need_sites:
+        run_site_diagnostics(
+            state,
+            coeffs_resid_nn,
+            sig_grid,
+            infer_idx,
+            model_name,
+        )
+    if need_campaigns:
+        run_campaign_diagnostics(
+            state,
+            coeffs_resid_nn,
+            sig_grid,
+            infer_idx,
+            model_name,
+        )
 
 
 def run_global_test(device, numgpu, model_name):
@@ -908,7 +1007,10 @@ if __name__ == "__main__":
 
     if do_train:
         run_model_name = active_model_name(hp)
-        print(f"[MODE] training enabled; fine_tune_sigma={bool(hp.get('fine_tune_sigma', False))}")
+        print(
+            f"[MODE] training enabled; "
+            f"fine_tune_sigma={bool(hp.get('fine_tune_sigma', False))}"
+        )
         print(f"[MODE] active training/output model = {run_model_name}")
     else:
         run_model_name = MODEL_NAME
@@ -916,20 +1018,64 @@ if __name__ == "__main__":
         print("[MODE] training and sigma fine tuning are disabled")
         print(f"[MODE] evaluation model = {run_model_name}")
 
+    # ------------------------------------------------------------
+    # Reuse raw site/campaign diagnostics whenever possible.
+    # Taper settings are deliberately NOT part of the cache signature because
+    # changing the taper is exactly the use case for this cache.
+    # ------------------------------------------------------------
+    site_cache_hit = False
+    campaign_cache_hit = False
+    if not do_train:
+        if do_sites:
+            site_cache_hit = diagnostic_cache_valid("site", run_model_name)
+        if do_campaigns:
+            campaign_cache_hit = diagnostic_cache_valid("campaign", run_model_name)
+
+    if site_cache_hit:
+        render_site_diagnostics(
+            load_diagnostic_cache("site", run_model_name)
+        )
+    if campaign_cache_hit:
+        render_campaign_diagnostics(
+            load_diagnostic_cache("campaign", run_model_name)
+        )
+
+    need_sites_compute = bool(do_sites and (do_train or not site_cache_hit))
+    need_campaigns_compute = bool(
+        do_campaigns and (do_train or not campaign_cache_hit)
+    )
+
     state = None
     model = None
-    if do_train or do_sites or do_campaigns:
-        state = load_site_campaign_state()
+
+    # Training always needs the campaign bundle when campaign files are
+    # configured because campaigns are part of the loss. Evaluation loads it
+    # only when campaign cache is missing.
+    if do_train or need_sites_compute or need_campaigns_compute:
+        state = load_site_campaign_state(
+            need_campaign_bundle=bool(do_train or need_campaigns_compute)
+        )
 
     if do_train:
         model, run_model_name = train_refinement_model(
             state, device, numgpu, numwork
         )
-    elif do_sites or do_campaigns:
+        # A newly trained model must generate fresh raw diagnostics; old cache
+        # hits were intentionally ignored above.
+        need_sites_compute = bool(do_sites)
+        need_campaigns_compute = bool(do_campaigns)
+    elif need_sites_compute or need_campaigns_compute:
         model = load_frozen_model(state, device, numgpu, run_model_name)
 
-    if do_sites or do_campaigns:
-        run_site_campaign_diagnostics(state, model, device)
+    if need_sites_compute or need_campaigns_compute:
+        run_site_campaign_diagnostics(
+            state,
+            model,
+            device,
+            run_model_name,
+            need_sites=need_sites_compute,
+            need_campaigns=need_campaigns_compute,
+        )
 
     run_global_test(device, numgpu, run_model_name)
     print("DONE.")
