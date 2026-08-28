@@ -1,8 +1,8 @@
 """Install post-inference pressure taper hooks for refinement diagnostics.
 
-This keeps the trained model and all training losses unchanged.  The hooks only
-replace the reconstruction/sampling functions used after coefficient inference,
-so site, campaign, and global diagnostics all evaluate the same final product.
+The trained model, coefficient inference, and reanalysis-emulation base product
+are left unchanged. Only the refined NN reconstruction (and its propagated
+uncertainty) receives the optional upper-level taper.
 """
 
 from __future__ import annotations
@@ -26,8 +26,24 @@ def _settings():
     )
 
 
+def _site_input_name(args, kwargs):
+    """Return the name of the site residual-coefficient input when available."""
+    if "A_sites_resid" in kwargs:
+        arr = kwargs["A_sites_resid"]
+    elif args:
+        arr = args[0]
+    else:
+        arr = None
+    return str(getattr(arr, "name", "") or "")
+
+
 def install_refinement_taper_hooks():
-    """Patch post-training reconstruction paths exactly once."""
+    """Patch post-training NN reconstruction paths exactly once.
+
+    Important scientific distinction:
+      - NN reconstruction: tapered according to config.
+      - base/reanalysis-emulation reconstruction: always left untouched.
+    """
     if getattr(data_handling, "_pressure_taper_installed", False):
         return
 
@@ -38,7 +54,14 @@ def install_refinement_taper_hooks():
     def reconstruct_Nd_from_coeffs_chunked_tapered(*args, **kwargs):
         ds = original_grid(*args, **kwargs)
         mode, p_start, p_top = _settings()
-        if mode == "none":
+
+        # In NDref_prob.py the refined NN call provides sigma_coeffs_abs,
+        # whereas the base/reanalysis-emulation call does not. This keeps
+        # Nd_base exactly as reconstructed by the base EOF emulation.
+        sigma_coeffs = kwargs.get("sigma_coeffs_abs", None)
+        is_refined_nn = sigma_coeffs is not None
+
+        if mode == "none" or not is_refined_nn:
             return ds
 
         ds = ds.copy()
@@ -68,7 +91,13 @@ def install_refinement_taper_hooks():
     def reconstruct_Nd_from_A_sites_tapered(*args, **kwargs):
         Nd_rec, A_abs_sites, A_mean_sites = original_sites(*args, **kwargs)
         mode, p_start, p_top = _settings()
-        if mode != "none":
+
+        # A_sites_from_Ares_base() explicitly names the base field
+        # "A_base_sites_resid". Do not alter that physically based comparator.
+        input_name = _site_input_name(args, kwargs)
+        is_base = input_name == "A_base_sites_resid"
+
+        if mode != "none" and not is_base:
             Nd_rec = apply_nd_pressure_taper(
                 Nd_rec,
                 Nd_mean=cfg.Nd_mean,
@@ -82,7 +111,18 @@ def install_refinement_taper_hooks():
     def sample_campaign_from_dense_predictions_tapered(*args, **kwargs):
         ds = original_campaign(*args, **kwargs)
         mode, p_start, p_top = _settings()
-        if mode == "none":
+
+        # The NN diagnostic supplies sigma_grid; the base comparator is called
+        # with sigma_grid=None. Taper only the final NN product.
+        if "sigma_grid" in kwargs:
+            sigma_grid = kwargs["sigma_grid"]
+        elif len(args) >= 2:
+            sigma_grid = args[1]
+        else:
+            sigma_grid = None
+        is_refined_nn = sigma_grid is not None
+
+        if mode == "none" or not is_refined_nn:
             return ds
 
         ds = ds.copy()
@@ -119,5 +159,6 @@ def install_refinement_taper_hooks():
     mode, p_start, p_top = _settings()
     print(
         f"[TAPER] installed refinement hooks: mode={mode} "
-        f"start={p_start:g} hPa top={p_top:g} hPa"
+        f"start={p_start:g} hPa top={p_top:g} hPa | "
+        "NN only; base reconstruction unchanged"
     )
