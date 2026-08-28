@@ -644,3 +644,239 @@ def plot_campaign_scatter_panels(
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[WROTE] {out_png}")
+    
+    
+    
+    
+ ###########################################################
+def plot_global_level_sigma_rel_inference(
+    sigmaNd_nn,     # xr.DataArray (time, lev, lat, lon)
+    Nd_nn,          # xr.DataArray (time, lev, lat, lon)
+    Nd_mean,        # xr.DataArray (lev), only used for pressure ticks
+    levels,         # list of hPa levels to map
+    out_png,
+    minSig=1e-6,    # mask tiny/invalid sigma
+    minNd=1.0,      # do not form sigma/Nd where Nd is tiny
+    vmin=0.0,       # relative sigma (%)
+    vmax=100.0,     # relative sigma (%)
+):
+    """
+    Inference-only relative-sigma diagnostic.
+
+    Computes, point by point:
+
+        relative_sigma = 100 * sigma_Nd / Nd
+
+    before taking temporal/spatial averages.
+
+    Produces:
+      - Maps: time-mean relative sigma at requested levels
+      - Zonal diagnostic: lon-mean of time-mean relative sigma
+        as a (lev x lat) heatmap
+
+    Relative sigma is expressed in percent.
+
+    Produces (len(levels) + 1) rows x 1 column.
+    """
+
+    # ============================================================
+    # Relative uncertainty: 100 * sigmaNd / Nd
+    # ============================================================
+
+    S = sigmaNd_nn.where(np.isfinite(sigmaNd_nn))
+    N = Nd_nn.where(np.isfinite(Nd_nn))
+
+    # Remove invalid/tiny sigma and very small Nd.
+    # The Nd threshold is important because sigma/Nd diverges as Nd -> 0.
+    valid = (
+        (S >= minSig)
+        & (N >= minNd)
+    )
+
+    S = S.where(valid)
+    N = N.where(valid)
+
+    rel = 100.0 * S / N
+    rel = rel.where(np.isfinite(rel))
+
+    # Mean of the pointwise relative uncertainty
+    avg_rel = rel.mean(dim="time", skipna=True)   # (lev, lat, lon)
+
+    # ============================================================
+    # Figure layout
+    # ============================================================
+
+    proj = ccrs.PlateCarree()
+    nrows = len(levels) + 1
+
+    fig = plt.figure(
+        figsize=(7.2, 3.2 * len(levels) + 2.2)
+    )
+
+    gs = GridSpec(
+        nrows=nrows,
+        ncols=1,
+        figure=fig,
+        height_ratios=[1.0] * len(levels) + [0.8],
+        hspace=0.18,
+        wspace=0.05,
+    )
+
+    axes = []
+
+    for i in range(len(levels)):
+        axes.append(
+            fig.add_subplot(gs[i, 0], projection=proj)
+        )
+
+    ax_zonal = fig.add_subplot(gs[nrows - 1, 0])
+
+    # ============================================================
+    # Color scale
+    # ============================================================
+
+    # Linear scale is easier to interpret for percentages.
+    norm = mcolors.Normalize(
+        vmin=vmin,
+        vmax=vmax,
+        clip=True,
+    )
+
+    shk = 0.55
+
+    # ============================================================
+    # Map panels
+    # ============================================================
+
+    for ax, lev in zip(axes, levels):
+
+        # nearest makes the function robust to slightly different
+        # pressure coordinates
+        rel_slice = avg_rel.sel(
+            lev=lev,
+            method="nearest",
+        )
+
+        actual_lev = float(rel_slice["lev"].values)
+
+        im = rel_slice.plot.pcolormesh(
+            ax=ax,
+            transform=proj,
+            cmap="viridis",
+            norm=norm,
+            add_colorbar=False,
+        )
+
+        ax.coastlines()
+        ax.add_feature(
+            cfeature.BORDERS,
+            linewidth=0.5,
+        )
+
+        ax.set_title(
+            rf"Time-mean relative $\sigma_{{N_d}}$ "
+            rf"@ {actual_lev:.0f} hPa"
+        )
+
+        fig.colorbar(
+            im,
+            ax=ax,
+            shrink=shk,
+            label=r"$100\,\sigma_{N_d}/N_d$ (%)",
+        )
+
+    # ============================================================
+    # Zonal diagnostic
+    # ============================================================
+
+    # First temporal mean already done above.
+    # Now average pointwise relative uncertainty over longitude.
+    zonal_rel = avg_rel.mean(
+        dim="lon",
+        skipna=True,
+    )   # (lev, lat)
+
+    Z = zonal_rel.values
+
+    imz = ax_zonal.imshow(
+        Z,
+        aspect="auto",
+        cmap="viridis",
+        norm=norm,
+        origin="upper",
+    )
+
+    fig.colorbar(
+        imz,
+        ax=ax_zonal,
+        shrink=0.9,
+        label=r"$100\,\sigma_{N_d}/N_d$ (%)",
+    )
+
+    # ============================================================
+    # Pressure-axis ticks
+    # ============================================================
+
+    p_lev = Nd_mean.lev.values
+
+    p_ticks = np.array([
+        1000,
+        850,
+        700,
+        500,
+        300,
+        200,
+    ])
+
+    yticks = [
+        int(np.argmin(np.abs(p_lev - p)))
+        for p in p_ticks
+    ]
+
+    ylabels = [
+        str(int(p))
+        for p in p_ticks
+    ]
+
+    ax_zonal.set_yticks(yticks)
+    ax_zonal.set_yticklabels(ylabels)
+    ax_zonal.set_ylabel("Pressure (hPa)")
+
+    # ============================================================
+    # Latitude-axis ticks
+    # ============================================================
+
+    lat = zonal_rel["lat"].values
+
+    nlt = 7
+    idx = np.linspace(
+        0,
+        len(lat) - 1,
+        nlt,
+    ).astype(int)
+
+    ax_zonal.set_xticks(idx)
+
+    ax_zonal.set_xticklabels([
+        f"{lat[i]:.0f}"
+        for i in idx
+    ])
+
+    ax_zonal.set_xlabel("Latitude (deg)")
+
+    ax_zonal.set_title(
+        r"Zonal mean relative uncertainty "
+        r"$100\,\sigma_{N_d}/N_d$"
+    )
+
+    # ============================================================
+    # Save
+    # ============================================================
+
+    plt.savefig(
+        out_png,
+        dpi=120,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)   

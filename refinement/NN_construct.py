@@ -1,3 +1,12 @@
+# ============================================================
+# construct_v1.py
+#
+# v1 uncertainty-control changes:
+#   1) mode-weighted fixed-site sigma regularization
+#   2) explicit hierarchical campaign sigma regularization
+#   3) optional detach of sigma branch from shared MODIS features
+# ============================================================
+
 import numpy as np
 import xarray as xr
 import dask
@@ -107,10 +116,23 @@ class ProbRefineFromBaseAndX(nn.Module):
     Outputs:
       mu    : [B, M, H, W]
       sigma : [B, M, H, W]
+
+    v2 changes:
+      detach_sigma_features=True prevents sigma-loss gradients from flowing
+      back into the shared MODIS encoder. The sigma head remains trainable.
     """
-    def __init__(self, in_channels, num_modes, feat_ch=32, head_ch=64, sigma_min=1e-3):
+    def __init__(
+        self,
+        in_channels,
+        num_modes,
+        feat_ch=32,
+        head_ch=64,
+        sigma_min=1e-3,
+        detach_sigma_features=True,
+    ):
         super().__init__()
         self.sigma_min = float(sigma_min)
+        self.detach_sigma_features = bool(detach_sigma_features)
 
         # Lightweight encoder for x2d (FAST)
         self.x_enc = nn.Sequential(
@@ -145,10 +167,15 @@ class ProbRefineFromBaseAndX(nn.Module):
         fx = self.x_enc(x2d)                # [B, feat_ch, H, W]
         h  = torch.cat([mu0, fx], dim=1)    # [B, M+feat_ch, H, W]
 
+        # Mean branch uses the shared representation normally.
         delta = self.delta_head(h)
         mu = mu0 + delta
 
-        rho = self.sigma_head(h)
+        # Uncertainty branch can be isolated from the shared encoder.
+        # Detaching h does NOT freeze sigma_head; it only blocks gradients
+        # from sigma losses into x_enc (and the input mu0 pathway).
+        h_sigma = h.detach() if self.detach_sigma_features else h
+        rho = self.sigma_head(h_sigma)
         sigma = F.softplus(rho) + self.sigma_min
         return mu, sigma
 
@@ -182,6 +209,8 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
         lambda_grad=0.001,
         lambda_anchor=0.01,
         lambda_sigma=0.01,
+        lambda_campaign_sigma=0.01,
+        sigma_mode_var_floor=0.05,
         lambda_sites=100.0,
         lambda_nd=1.0,
         lambda_Ndgauss=0.1,
@@ -221,7 +250,19 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
         self.register_buffer("lat_w_grid", lat_w_grid / lat_w_grid.mean().clamp(min=1e-12))
 
         mw = torch.as_tensor(mode_weights, dtype=torch.float32)
-        self.register_buffer("mode_w", mw / mw.mean().clamp(min=1e-12))
+        mode_w = mw / mw.mean().clamp(min=1e-12)
+
+        # Preserve the original EOF-mode weighting in all existing likelihoods.
+        self.register_buffer("mode_w", mode_w)
+
+        # Sigma regularization uses the same supplied EOF-derived quantity as
+        # a RELATIVE mode variance: sigma_m^2 / V_m(rel).  Only this sigma
+        # normalization gets a floor, so tiny high-order EOF energies cannot
+        # create an arbitrarily large regularization gradient.
+        self.sigma_mode_var_floor = float(sigma_mode_var_floor)
+        mode_var_rel = torch.clamp(mode_w, min=self.sigma_mode_var_floor)
+        self.register_buffer("mode_var_rel", mode_var_rel)
+        self.register_buffer("mode_std_rel", torch.sqrt(mode_var_rel))
 
         # -------------------------
         # EOF / Nd / Amean
@@ -259,6 +300,7 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
         self.lambda_grad = float(lambda_grad)
         self.lambda_anchor = float(lambda_anchor)
         self.lambda_sigma = float(lambda_sigma)
+        self.lambda_campaign_sigma = float(lambda_campaign_sigma)
         self.lambda_sites = float(lambda_sites)
         self.lambda_nd = float(lambda_nd)
         self.lambda_Ndgauss = float(lambda_Ndgauss)
@@ -388,6 +430,21 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
         return loss_s[valid_site].mean()
 
     def masked_sigma_mean_equal_sites(self, sig_s, vS):
+        """
+        Variance-relative sigma penalty at fixed sites.
+
+        The EOF-derived mode_weights passed to this loss are interpreted as
+        relative mode variances V_m / mean(V).  The regularizer is therefore
+
+            L_sigma = mean[ sigma_m^2 / V_m(rel) ]
+
+        over valid batch/mode entries, followed by equal weighting across
+        sites.  This penalizes uncertainty relative to the characteristic
+        variance of each EOF mode instead of penalizing absolute sigma.
+
+        sig_s : [B,M,S]
+        vS    : [B,S]
+        """
         vS = vS.bool()
         finite = torch.isfinite(sig_s) & vS[:, None, :]
         cnt_s = finite.sum(dim=(0, 1))
@@ -397,12 +454,32 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
             return self._zero_like_sum(sig_s)
 
         sig = self._safe_sigma_stable(sig_s)
-        sig = torch.where(finite, sig, torch.zeros_like(sig))
+        mode_var = self.mode_var_rel.view(1, -1, 1).float()
 
+        rel_var = (sig * sig) / mode_var
+        rel_var = torch.where(finite, rel_var, torch.zeros_like(rel_var))
+
+        num_s = rel_var.sum(dim=(0, 1))
+        den_s = finite.float().sum(dim=(0, 1)).clamp(min=1.0)
+        loss_s = num_s / den_s
+
+        # Equal weighting between sites.
+        return loss_s[valid_site].mean()
+
+    def masked_sigma_raw_mean_equal_sites(self, sig_s, vS):
+        """Raw mean sigma diagnostic only; not used in the loss."""
+        vS = vS.bool()
+        finite = torch.isfinite(sig_s) & vS[:, None, :]
+        cnt_s = finite.sum(dim=(0, 1))
+        valid_site = cnt_s >= 1
+        if int(valid_site.sum().detach().cpu().item()) < 1:
+            return self._zero_like_sum(sig_s)
+
+        sig = self._safe_sigma_stable(sig_s)
+        sig = torch.where(finite, sig, torch.zeros_like(sig))
         num_s = sig.sum(dim=(0, 1))
         den_s = cnt_s.to(num_s.dtype).clamp(min=1.0)
-        sig_s_mean = num_s / den_s
-        return sig_s_mean[valid_site].mean()
+        return (num_s / den_s)[valid_site].mean()
 
     def predict_Nd_sites_from_abs_coeffs(self, A_abs_s):
         A = self._clip_abs(self._f32(A_abs_s), self.max_abs_coeff)
@@ -606,6 +683,49 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
 
         return torch.stack(camp_vals).mean()
 
+    def campaign_sigma_penalty(self, sigA_seg, valid_obs, campaign_id, group_id=None):
+        """
+        Variance-relative coefficient-sigma penalty at campaign locations.
+
+        For each campaign segment:
+
+            point_loss = mean_m[ sigma_m^2 / V_m(rel) ]
+
+        where V_m(rel) is the normalized EOF-derived mode variance supplied
+        through mode_weights.  The existing hierarchical reduction then gives
+        equal weight to groups within campaigns and equal weight to campaigns.
+        """
+        finite = valid_obs.bool() & torch.isfinite(sigA_seg).all(dim=1)
+        if int(finite.sum().detach().cpu().item()) < 1:
+            return None
+
+        sig = self._safe_sigma_stable(sigA_seg)
+        mode_var = self.mode_var_rel.view(1, -1).float()
+
+        point_rel_var = ((sig * sig) / mode_var).mean(dim=1)
+
+        return self._hierarchical_campaign_reduce(
+            point_loss=point_rel_var,
+            valid=finite,
+            campaign_id=campaign_id,
+            group_id=group_id,
+        )
+
+    def campaign_sigma_raw_mean(self, sigA_seg, valid_obs, campaign_id, group_id=None):
+        """Raw mean sigma diagnostic only; not used in the loss."""
+        finite = valid_obs.bool() & torch.isfinite(sigA_seg).all(dim=1)
+        if int(finite.sum().detach().cpu().item()) < 1:
+            return None
+
+        sig = self._safe_sigma_stable(sigA_seg)
+        point_sigma = sig.mean(dim=1)
+        return self._hierarchical_campaign_reduce(
+            point_loss=point_sigma,
+            valid=finite,
+            campaign_id=campaign_id,
+            group_id=group_id,
+        )
+
     def campaign_mse(self, Nd_pred_seg, Nd_obs_seg, valid_obs, campaign_id, group_id=None):
         finite = valid_obs.bool() & torch.isfinite(Nd_pred_seg) & torch.isfinite(Nd_obs_seg)
         if int(finite.sum().detach().cpu().item()) < 1:
@@ -697,7 +817,8 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
 
             if self.lambda_sigma > 0:
                 L_sig = self.masked_sigma_mean_equal_sites(sig_s, vS)
-                sig_mean_sites_scalar = float(L_sig.detach().cpu())
+                sig_raw = self.masked_sigma_raw_mean_equal_sites(sig_s, vS)
+                sig_mean_sites_scalar = float(sig_raw.detach().cpu())
             vS_frac_scalar = float(vS.float().mean().detach().cpu())
 
             if self._has_obs(Nd_obs_sites):
@@ -718,6 +839,8 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
         # -------------------------
         L_campaign = self._zero_like_sum(dA0)
         L_campaign_gauss = self._zero_like_sum(dA0)
+        L_campaign_sig = self._zero_like_sum(dA0)
+        campaign_sig_mean_scalar = 0.0
         n_campaign_valid = 0.0
 
         have_campaign = (
@@ -730,7 +853,11 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
             self._has_obs(seg_campaign_id)
         )
 
-        if have_campaign and (self.lambda_campaign > 0 or self.lambda_campaign_gauss > 0):
+        if have_campaign and (
+            self.lambda_campaign > 0
+            or self.lambda_campaign_gauss > 0
+            or self.lambda_campaign_sigma > 0
+        ):
             seg_batch_idx = seg_batch_idx.long()
             seg_ilat = seg_ilat.long()
             seg_ilon = seg_ilon.long()
@@ -749,6 +876,27 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
 
             valid_campaign = seg_valid_obs & valid_p & torch.isfinite(seg_y)
             n_campaign_valid = float(valid_campaign.float().sum().detach().cpu())
+
+            # Explicit sigma control at campaign locations. This closes the
+            # asymmetry where campaign Gaussian NLL could reward larger sigma
+            # without an equivalent campaign-local sigma penalty.
+            if self.lambda_campaign_sigma > 0:
+                Ltmp = self.campaign_sigma_penalty(
+                    sigA_seg=sigA_seg,
+                    valid_obs=valid_campaign,
+                    campaign_id=seg_campaign_id,
+                    group_id=seg_group_id,
+                )
+                if Ltmp is not None:
+                    L_campaign_sig = Ltmp
+                    sig_raw = self.campaign_sigma_raw_mean(
+                        sigA_seg=sigA_seg,
+                        valid_obs=valid_campaign,
+                        campaign_id=seg_campaign_id,
+                        group_id=seg_group_id,
+                    )
+                    if sig_raw is not None:
+                        campaign_sig_mean_scalar = float(sig_raw.detach().cpu())
 
             if self.lambda_campaign > 0:
                 Ltmp = self.campaign_mse(
@@ -781,13 +929,15 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
         L_anchor_w = self.lambda_anchor * L_anchor
         L_grad_w = self.lambda_grad * L_grad
         L_sig_w = self.lambda_sigma * L_sig
+        L_campaign_sig_w = self.lambda_campaign_sigma * L_campaign_sig
         L_nd_w = self.lambda_nd * L_nd
         L_nd_gauss_w = self.lambda_Ndgauss * L_nd_gauss
         L_campaign_w = self.lambda_campaign * L_campaign
         L_campaign_gauss_w = self.lambda_campaign_gauss * L_campaign_gauss
 
         loss = (
-            L_site_w + L_anchor_w + L_grad_w + L_sig_w +
+            L_site_w + L_anchor_w + L_grad_w +
+            L_sig_w + L_campaign_sig_w +
             L_nd_w + L_nd_gauss_w +
             L_campaign_w + L_campaign_gauss_w
         )
@@ -799,6 +949,7 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
                 f"L_anchor={float(L_anchor_w.detach().cpu())} "
                 f"L_grad={float(L_grad_w.detach().cpu())} "
                 f"L_sig={float(L_sig_w.detach().cpu())} "
+                f"L_campaign_sig={float(L_campaign_sig_w.detach().cpu())} "
                 f"L_nd={float(L_nd_w.detach().cpu())} "
                 f"L_nd_gauss={float(L_nd_gauss_w.detach().cpu())} "
                 f"L_campaign={float(L_campaign_w.detach().cpu())} "
@@ -814,11 +965,15 @@ class SparseSiteCampaignNLLRefineLoss(nn.Module):
             "L_anchor": float(L_anchor_w.detach().cpu()),
             "L_grad": float(L_grad_w.detach().cpu()),
             "L_sig": float(L_sig_w.detach().cpu()),
+            "L_campaign_sig": float(L_campaign_sig_w.detach().cpu()),
             "L_nd": float(L_nd_w.detach().cpu()),
             "L_nd_gauss": float(L_nd_gauss_w.detach().cpu()),
             "L_campaign": float(L_campaign_w.detach().cpu()),
             "L_campaign_gauss": float(L_campaign_gauss_w.detach().cpu()),
             "sig_mean_sites": float(sig_mean_sites_scalar),
+            "sig_mean_campaign": float(campaign_sig_mean_scalar),
+            "sigvar_rel_sites": float(L_sig.detach().cpu()),
+            "sigvar_rel_campaign": float(L_campaign_sig.detach().cpu()),
             "vS_frac": float(vS_frac_scalar),
             "n_campaign_valid": float(n_campaign_valid),
         }

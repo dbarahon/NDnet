@@ -594,7 +594,7 @@ def project_coeffs_at_sites_only(
     # 4) FILLING LOGIC for Nd + error
     # -------------------------
     Ns = fillna_with_site_level_normal_site_mean_mask(
-        Nd_sites, seed=42, min_count=3, ddof=1, clip_min=0.0
+        Nd_sites, seed=42, min_count=10, ddof=1, clip_min=0.0
     )
 
     # error: fill with mean error at that (lev,site)

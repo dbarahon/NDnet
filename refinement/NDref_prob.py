@@ -29,19 +29,201 @@ torch.set_float32_matmul_precision("high")  # PyTorch 2.x
 
 
 
-def build_model(in_channels, numgpu, device):
+def build_model(in_channels, numgpu, device, hp):
+    """Build the refinement model with optional sigma-feature detachment."""
     model = ProbRefineFromBaseAndX(
         in_channels=in_channels,
         num_modes=num_modes,
         feat_ch=32,
         head_ch=64,
-        sigma_min=1e-3,
+        # Keep the historical model-output floor unless explicitly changed.
+        sigma_min=float(hp.get("model_sigma_min", 1e-3)),
+        detach_sigma_features=bool(hp.get("detach_sigma_features", True)),
     ).to(device)
 
     if numgpu > 1:
         model = nn.DataParallel(model)
     return model
 
+
+
+def active_model_name(hp):
+    """Return the model name used for outputs/inference for the selected mode."""
+    if bool(hp.get("fine_tune_sigma", False)):
+        return hp.get(
+            "sigma_finetune_model_name",
+            hp["model_name"] + "_sigmaFT",
+        )
+    return hp["model_name"]
+
+
+
+def configure_training_stage(model, criterion, hp, device):
+    """
+    Configure normal training or optional sigma-only fine tuning.
+
+    Normal mode:
+      - all currently trainable parameters are optimized
+      - checkpoint + optimizer state are resumed as before
+
+    Sigma fine-tune mode:
+      - load the best weights from the completed base run
+      - freeze the whole model
+      - re-enable only sigma_head
+      - disable mean-only loss terms
+      - keep Gaussian likelihood terms active
+      - strengthen variance-relative sigma penalties
+      - start a fresh sigma-only optimizer and epoch count
+
+    Returns
+    -------
+    optimizer, start_epoch, hp_run
+    """
+    fine_tune_sigma = bool(hp.get("fine_tune_sigma", False))
+    base_model_name = hp["model_name"]
+
+    hp_run = hp.copy()
+    hp_run["model_name"] = active_model_name(hp)
+
+    if fine_tune_sigma:
+        print("=" * 70)
+        print("[SIGMA-FT] SIGMA-ONLY FINE TUNING")
+        print("=" * 70)
+
+        source_weights = hp.get(
+            "sigma_finetune_source_weights",
+            base_model_name + "_weights.pt",
+        )
+
+        # Load only model weights from the good full-model solution.
+        # Do not restore the old optimizer: its parameter groups contain
+        # the full model, whereas this stage trains sigma_head only.
+        load_model_weights_for_inference(
+            model,
+            source_weights,
+            device=device,
+            strict=True,
+            eval_mode=False,
+        )
+        model.train()
+
+        # DataParallel-safe access to model submodules.
+        core_model = model.module if isinstance(model, nn.DataParallel) else model
+
+        # Freeze everything, then re-enable only the uncertainty head.
+        for p in core_model.parameters():
+            p.requires_grad = False
+        for p in core_model.sigma_head.parameters():
+            p.requires_grad = True
+
+        # Mean-only terms cannot improve a frozen mean predictor.
+        criterion.lambda_anchor = 0.0
+        criterion.lambda_grad = 0.0
+        criterion.lambda_nd = 0.0
+        criterion.lambda_campaign = 0.0
+
+        # Optional sigma-FT overrides for likelihood terms.  If absent,
+        # retain the normal-training values already stored in criterion.
+        criterion.lambda_sites = float(
+            hp.get("sigma_finetune_lambda_sites", criterion.lambda_sites)
+        )
+        criterion.lambda_Ndgauss = float(
+            hp.get("sigma_finetune_lambda_Ndgauss", criterion.lambda_Ndgauss)
+        )
+        criterion.lambda_campaign_gauss = float(
+            hp.get(
+                "sigma_finetune_lambda_campaign_gauss",
+                criterion.lambda_campaign_gauss,
+            )
+        )
+
+        # Stronger variance-relative sigma regularization.
+        criterion.lambda_sigma = float(
+            hp.get("sigma_finetune_lambda_sigma", 5.0)
+        )
+        criterion.lambda_campaign_sigma = float(
+            hp.get("sigma_finetune_lambda_campaign_sigma", 2.0)
+        )
+
+        params = [p for p in model.parameters() if p.requires_grad]
+        if not params:
+            raise RuntimeError("[SIGMA-FT] No trainable sigma_head parameters found.")
+
+        optimizer = optim.Adam(
+            params,
+            lr=float(hp.get("sigma_finetune_lr", 1e-5)),
+            weight_decay=float(hp.get("sigma_finetune_weight_decay", 1e-5)),
+        )
+
+        # Treat calibration as a new short training stage.
+        start_epoch = 0
+        hp_run["nepochs"] = int(hp.get("sigma_finetune_epochs", 30))
+        hp_run["patience"] = int(
+            hp.get("sigma_finetune_patience", hp.get("patience", 20))
+        )
+
+        # The normal campaign monitor was designed for mean/campaign skill.
+        # For sigma calibration, validation loss already contains the site,
+        # Nd-Gaussian, campaign-Gaussian, and sigma penalties.  Default to
+        # monitoring that complete validation objective directly.
+        hp_run["use_campaign_monitor"] = bool(
+            hp.get("sigma_finetune_use_campaign_monitor", False)
+        )
+        hp_run["campaign_monitor_beta"] = float(
+            hp.get("sigma_finetune_campaign_monitor_beta", 0.0)
+        )
+
+        print(f"[SIGMA-FT] source weights          = {source_weights}")
+        print(f"[SIGMA-FT] output model            = {hp_run['model_name']}")
+        print(f"[SIGMA-FT] epochs                  = {hp_run['nepochs']}")
+        print(f"[SIGMA-FT] lr                      = {optimizer.param_groups[0]['lr']:.3e}")
+        print(f"[SIGMA-FT] lambda_sites            = {criterion.lambda_sites:g}")
+        print(f"[SIGMA-FT] lambda_Ndgauss          = {criterion.lambda_Ndgauss:g}")
+        print(f"[SIGMA-FT] lambda_campaign_gauss   = {criterion.lambda_campaign_gauss:g}")
+        print(f"[SIGMA-FT] lambda_sigma            = {criterion.lambda_sigma:g}")
+        print(f"[SIGMA-FT] lambda_campaign_sigma   = {criterion.lambda_campaign_sigma:g}")
+        print(f"[SIGMA-FT] campaign monitor        = {hp_run['use_campaign_monitor']}")
+
+    else:
+        # Original normal-training/resume behavior.
+        params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = optim.Adam(
+            params,
+            lr=hp["l_r"],
+            weight_decay=1e-5,
+        )
+
+        start_epoch = load_training_checkpoint(
+            model,
+            optimizer,
+            base_model_name + ".ckpt",
+            device,
+        )
+
+    # Common sanity diagnostics.
+    trainable_names = [
+        name for name, p in model.named_parameters() if p.requires_grad
+    ]
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    print("[DBG] #trainable tensors:", len(params))
+    print("[DBG] #trainable params:", sum(p.numel() for p in params))
+    print("[DBG] trainable parameter tensors:")
+    for name in trainable_names:
+        print("      ", name)
+
+    if fine_tune_sigma:
+        bad = [
+            n for n in trainable_names
+            if "sigma_head" not in n
+        ]
+        if bad:
+            raise RuntimeError(
+                "[SIGMA-FT] Non-sigma parameters are trainable: "
+                + ", ".join(bad)
+            )
+
+    return optimizer, start_epoch, hp_run
 
 
 
@@ -55,6 +237,11 @@ if __name__ == "__main__":
     numwork = 0
 
     print("Using DataParallel on", numgpu, "GPUs")
+
+    fine_tune_sigma = bool(hp.get("fine_tune_sigma", False))
+    run_model_name = active_model_name(hp)
+    print(f"[MODE] fine_tune_sigma = {fine_tune_sigma}")
+    print(f"[MODE] active model    = {run_model_name}")
 
     if do_train:
 
@@ -219,7 +406,7 @@ if __name__ == "__main__":
               # ---------- MODEL ----------
         in_channels = len(list(Nin_2d.data_vars))
 
-        model = build_model(in_channels, numgpu, device)
+        model = build_model(in_channels, numgpu, device, hp)
         # ---------- LOSS ----------
         latitudes = Nin_2d.lat.values
         
@@ -233,7 +420,6 @@ if __name__ == "__main__":
             A_mean=A_mean,
             lambda_grad=float(hp.get("lambda_grad", 0.005)),
             lambda_anchor=float(hp.get("lambda_anchor", 0.01)),
-            lambda_sigma=float(hp.get("lambda_sigma", 0.0)),
             lambda_sites=float(hp.get("lambda_sites", 1.0)),
             lambda_nd=float(hp.get("lambda_nd", 1.0)),
             lambda_Ndgauss=float(hp.get("lambda_Ndgauss", 1.0)),
@@ -241,25 +427,22 @@ if __name__ == "__main__":
             lambda_campaign_gauss=float(hp.get("lambda_campaign_gauss", 1.0)),
             min_sigma=hp.get("min_sigma", 1e-3),
             err_mix=hp.get("err_mix", 0.15),
-        ).to(device)
+            lambda_sigma=hp["lambda_sigma"],
+            lambda_campaign_sigma=hp["lambda_campaign_sigma"],
+    		sigma_mode_var_floor=hp["sigma_mode_var_floor"],
+            ).to(device)
  
         # DataParallel if needed
         #if numgpu > 1:
         #@    model = nn.DataParallel(model)
 
-        # ---------- OPTIMIZER ----------
-        # Only train parameters that require grad (adapter heads if backbone frozen)
-        params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = optim.Adam(params, lr=hp["l_r"], weight_decay=1e-5)
-
-        
-        params = [p for p in model.parameters() if p.requires_grad]
-        print("[DBG] #trainable tensors:", len(params))
-        print("[DBG] #trainable params:", sum(p.numel() for p in params))
-        optimizer = optim.Adam(params, lr=hp["l_r"], weight_decay=1e-5)
-
-
-        start_epoch = load_training_checkpoint(model, optimizer, hp["model_name"] + ".ckpt", device)
+        # ---------- OPTIMIZER / OPTIONAL SIGMA-ONLY FINE TUNING ----------
+        optimizer, start_epoch, hp_run = configure_training_stage(
+            model=model,
+            criterion=criterion,
+            hp=hp,
+            device=device,
+        )
 
         train_losses, val_losses = training_val(
             model,
@@ -267,7 +450,7 @@ if __name__ == "__main__":
             train_loader,
             val_loader,
             optimizer,
-            hp,
+            hp_run,
             device,
             start_epoch=start_epoch
         )
@@ -277,7 +460,7 @@ if __name__ == "__main__":
         plt.plot(val_losses, label="Val")        
         plt.legend()
         plt.xlim(left=5)
-        plt.savefig(hp["model_name"] + "_loss.png")
+        plt.savefig(hp_run["model_name"] + "_loss.png")
         print("========== DONE training")
 
         # --------------------------------------------------
@@ -609,12 +792,12 @@ if __name__ == "__main__":
                 # Build model first (same architecture as training)
        
         in_channels = len(list(Nin_2d.data_vars))
-        model = build_model(in_channels, numgpu, device)
+        model = build_model(in_channels, numgpu, device, hp)
 
         # Load weights
         load_model_weights_for_inference(
             model,
-            hp["model_name"] + "_weights.pt",
+            run_model_name + "_weights.pt",
             device=device,
             strict=True,     # set False if you changed heads
             eval_mode=True
@@ -694,7 +877,7 @@ if __name__ == "__main__":
     #dsG = xr.merge([dsG, dsSigma])
 
     print(dsG)
-    safe_to_netcdf_chunked(dsG, "NDnet_global_test.nc")
+    safe_to_netcdf_chunked(dsG, f"{run_model_name}_global_test.nc")
     print("[WRITE] NDnet_global_test.nc")
 
     plot_global_level_comparison(
@@ -706,12 +889,23 @@ if __name__ == "__main__":
     )
     print("[PLOT] NDnet_global_test_levels.png")
     
-    plot_global_level_sigma_inference(
-    sigmaNd_nn=dsG["sigmaNd_nn"],
-    Nd_mean=Nd_mean,
-    levels=[500, 700, 900],
-    out_png="NDnet_global_sigma_levels.png",
-	)
+    #plot_global_level_sigma_inference(
+    #sigmaNd_nn=dsG["sigmaNd_nn"],
+    #Nd_mean=Nd_mean,
+    #levels=[500, 700, 900],
+    #out_png=f"{run_model_name}_global_sigma_levels.png",
+	#)
 
+    
+    plot_global_level_sigma_rel_inference(
+        sigmaNd_nn=dsG["sigmaNd_nn"],
+        Nd_nn=dsG["Nd_nn"],
+        Nd_mean=Nd_mean,
+        levels=[500, 700, 900],
+        out_png="NDnet_global_relative_sigma_levels.png",
+        minNd=1.0,
+        vmin=0,
+        vmax=100,
+    )
 
     print("DONE.")

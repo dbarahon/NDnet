@@ -12,50 +12,86 @@ do_campaigns= True
 do_test = True
 min_valid_lev =  2
 write_site_debug =  False 
-print_every =100
+print_every =50
 bypass_infer= False
 
-#prefix = '*2020*'
+prefix = '*2020*'
 prefix_dense = '*20[0-2]*'
 prefix_sites = '*20[1-2]*'
-test_pr = '*202001*' 
-#test_pr = '*2009*' 
+test_pr = '*2009*' 
 
 deb =  0
 if deb > 0:
     prefix_dense = '*2020*'
     prefix_sites = '*2020*'
+    test_pr = '*200901*' 
     print_every =10
 
 sitemaskmode = "obs_dates" # "obs_levels" | "obs_dates" | "none" makes little difference, use dates though
 
 
 hp = {
-    "nepochs": 2000,            # with better sampling, you usually do not need 1800
+    "nepochs": 3000,
     "batch_sz": 16,
-    "l_r": 1e-5,               # slightly lower for stability with stronger site weighting
-    "patience": 40,            # allow sampler+anneal to work
+    "l_r": 5e-5,
+    "patience": 20,
+
     "model_name": MODEL_NAME,
     "rolling_Nr": 10,
     "basech": 64,
-    "site_sampling_beta": 1.,    # inverse-frequency; <1 softer; >1 more aggressive
+
+    "site_sampling_beta": 1.0,
     "use_site_sampler": False,
-    "min_sites_for_sampling":1,
-    "lambda_sites": 0.001,           # increase; 50 is often still not enough
-    "lambda_anchor": 10,        # reduce anchor
-    "lambda_anchor_decay": 1,   # slower decay than 0.95 to keep stability
-    "lambda_anchor_min": 1,     # lower floor so sites can still move things late
-    "lambda_grad": 0,           # reduce TV; 1e-3 can block corrections, 
-    "lambda_nd": 0.005,
-    "lambda_Ndgauss": 1,
-    "lambda_sigma": 1,        # penalize sigma inflation (prevents ?cheating?)
-    "min_sigma": 1,            # if you expose it; tighten from 1e2
-    "err_mix": 0.15, 
-    "use_campaign_monitor": True,
-	"campaign_monitor_beta": 1.0,
-    "lambda_campaign": 0.0005, 
-    "lambda_campaign_gauss": 1.0   
+    "min_sites_for_sampling": 1,
+
+    # Mean constraints
+    "lambda_sites": 0.05,
+    "lambda_anchor": 1.0,
+    "lambda_anchor_decay": 1.0,
+    "lambda_anchor_min": 0.1,
+    "lambda_grad": 0.0,
+
+    "lambda_nd": 0.5,
+    "lambda_campaign": 1.0,
+
+    # Probabilistic terms
+    "lambda_Ndgauss": 0.25,
+    "lambda_campaign_gauss": 0.20,
+
+    # Variance-relative sigma penalty
+    "lambda_sigma": 2.0,
+    "lambda_campaign_sigma": 1.0,
+    "sigma_mode_var_floor": 0.05,
+
+    "min_sigma": 0.1,
+
+    # Protect shared mean features from sigma branch
+    "detach_sigma_features": True,
+
+    # -------------------------------------------------
+    # Optional sigma-only fine tuning
+    # -------------------------------------------------
+    "fine_tune_sigma": True,
+
+
+    "sigma_finetune_lr": 5e-5,
+    "sigma_finetune_epochs": 50,
+    "sigma_finetune_patience": 15,
+
+    "sigma_finetune_lambda_sigma": 20.0,
+    "sigma_finetune_lambda_campaign_sigma": 6.0,
+
+    # Optional: otherwise retain normal Gaussian-loss values
+     "sigma_finetune_lambda_sites": 0.04,
+     "sigma_finetune_lambda_Ndgauss": 0.20,
+     "sigma_finetune_lambda_campaign_gauss": 0.15,
+
+    # I recommend leaving this off for the calibration pass.
+    # The normal validation loss already contains the sigma penalties.
+    "sigma_finetune_use_campaign_monitor": False,
 }
+
+
 
 
 # Paths / constants
