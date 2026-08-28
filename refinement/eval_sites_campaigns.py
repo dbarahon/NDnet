@@ -36,17 +36,17 @@ from campaign import (
     sample_campaign_from_dense_predictions,
     tensorize_campaign_inputs_from_existing,
 )
-from data_handling import (
-    A_sites_from_Ares_base,
-    A_sites_from_infer_grid,
-    get_data,
-    reconstruct_Nd_from_A_sites,
-    tensorize_sites_inputs_v2,
-)
+from data_handling import get_data, reconstruct_Nd_from_A_sites
 from NDref_prob import active_model_name, build_model
 from plotting import plot_campaign_scatter_panels, plot_vertical_profiles_sites
 from train_infer import load_model_weights_for_inference, run_infer_x_mu0
-from utils import make_canonical_da, safe_to_netcdf
+from utils import (
+    A_sites_from_Ares_base,
+    A_sites_from_infer_grid,
+    make_canonical_da,
+    safe_to_netcdf,
+    tensorize_sites_inputs_v2,
+)
 
 
 def _load_eval_data():
