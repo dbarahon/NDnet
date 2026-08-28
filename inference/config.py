@@ -15,6 +15,17 @@ END_DATE   = "2024-12-31"   # inclusive
 OUTDIR     = "./NDnet_infer_daily/"
 os.makedirs(OUTDIR, exist_ok=True)
 
+# -------------------------------------------------
+# Post-inference upper-pressure taper
+# -------------------------------------------------
+# Options:
+#   "none"        -> original EOF reconstruction
+#   "climatology" -> taper only Nd anomaly to zero aloft
+#   "zero"        -> taper total Nd to zero aloft
+UPPER_TAPER_MODE = "climatology"
+UPPER_TAPER_START_HPA = 500.0
+UPPER_TAPER_TOP_HPA = 350.0
+SAVE_RAW_TAPER_FIELDS = False
 
 
 
