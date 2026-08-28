@@ -2,7 +2,7 @@
 
 Behavior
 --------
-- ``do_train=True``: execute the existing training workflow unchanged.  Its
+- ``do_train=True``: execute the existing training workflow unchanged. Its
   existing site/campaign diagnostics run after training.
 - ``do_train=False``: skip all optimization, including sigma fine tuning, run
   the existing global test path (if enabled), then run the requested site and
@@ -22,8 +22,15 @@ from taper_hooks import install_refinement_taper_hooks
 if __name__ == "__main__":
     install_refinement_taper_hooks()
 
+    if not bool(cfg.do_train):
+        print("=" * 70)
+        print("[MODE] do_train=False -> frozen evaluation only")
+        print("[MODE] training and sigma fine tuning are disabled")
+        print("[MODE] do_sites/do_campaigns/do_test remain independent")
+        print("=" * 70)
+
     # The legacy main already behaves correctly for training and for the
-    # global do_test path.  With do_train=False it never enters
+    # global do_test path. With do_train=False it never enters
     # configure_training_stage(), so sigma fine tuning is not executed.
     runpy.run_path(
         str(Path(__file__).with_name("NDref_prob.py")),
@@ -31,7 +38,7 @@ if __name__ == "__main__":
     )
 
     # In the legacy main, site/campaign diagnostics are nested inside
-    # ``if do_train``.  Supply them explicitly in evaluation-only mode.
+    # ``if do_train``. Supply them explicitly in evaluation-only mode.
     if not bool(cfg.do_train) and (
         bool(getattr(cfg, "do_sites", False))
         or bool(getattr(cfg, "do_campaigns", False))
