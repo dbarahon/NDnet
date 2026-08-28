@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import xarray as xr
 
-VALID_TAPER_MODES = ("none", "climatology", "zero")
+VALID_TAPER_MODES = ("none", "climatology", "zero", "base")
 
 
 def normalize_taper_mode(mode: str | None) -> str:
@@ -24,6 +24,8 @@ def normalize_taper_mode(mode: str | None) -> str:
         "mean": "climatology",
         "nd_mean": "climatology",
         "0": "zero",
+        "reanalysis": "base",
+        "baseline": "base",
     }
     mode = aliases.get(mode, mode)
     if mode not in VALID_TAPER_MODES:
@@ -110,20 +112,29 @@ def apply_nd_pressure_taper(
     mode="climatology",
     p_start=500.0,
     p_top=350.0,
+    base_nd=None,
     clip_min=0.0,
     name=None,
 ):
     """Apply the selected upper-pressure taper to reconstructed Nd.
 
-    ``climatology`` tapers only the Nd anomaly::
+    ``climatology`` relaxes the NN anomaly toward the EOF climatology::
 
         Nd_final = Nd_mean(p) + T(p) * [Nd_raw - Nd_mean(p)]
 
-    ``zero`` tapers total Nd::
+    ``zero`` relaxes total Nd toward zero::
 
         Nd_final = T(p) * Nd_raw
 
-    ``none`` returns the raw reconstruction unchanged.
+    ``base`` relaxes the refined NN product toward the physically based
+    reanalysis-emulation product::
+
+        Nd_final = Nd_base + T(p) * [Nd_raw - Nd_base]
+
+    ``none`` returns the raw NN reconstruction unchanged.
+
+    In base mode ``base_nd`` is required and is never modified by this
+    function.
     """
     mode = normalize_taper_mode(mode)
     if mode == "none":
@@ -145,8 +156,12 @@ def apply_nd_pressure_taper(
 
     if mode == "climatology":
         target = interp_profile_logp(Nd_mean, pressure_hpa)
-    else:
+    elif mode == "zero":
         target = 0.0
+    else:
+        if base_nd is None:
+            raise ValueError("base_nd is required when upper-taper mode is 'base'")
+        target = base_nd
 
     out = target + T * (nd_raw - target)
 
@@ -179,9 +194,11 @@ def apply_sigma_pressure_taper(
 ):
     """Apply the uncertainty transformation consistent with the Nd taper.
 
-    In either active taper mode the modeled uncertainty is uncertainty in the
-    EOF-derived part of the profile, so sigma_final = T(p) * sigma_raw.
-    The climatological mean is treated as deterministic in this product.
+    For every active taper mode, sigma_final = T(p) * sigma_raw.  In
+    ``climatology`` mode the climatology is treated as deterministic; in
+    ``base`` mode the reanalysis-emulation fallback is treated as the fixed
+    reference and this sigma represents uncertainty in the refined departure
+    from it.
     """
     mode = normalize_taper_mode(mode)
     if mode == "none":
