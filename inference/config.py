@@ -20,8 +20,10 @@ os.makedirs(OUTDIR, exist_ok=True)
 # -------------------------------------------------
 # Options:
 #   "none"        -> original EOF reconstruction
-#   "climatology" -> taper only Nd anomaly to zero aloft
-#   "zero"        -> taper total Nd to zero aloft
+#   "climatology" -> relax refined Nd toward Nd_mean aloft
+#   "zero"        -> relax total refined Nd toward zero aloft
+#   "base"        -> relax refined Nd toward the physically based
+#                    reanalysis-emulation/base reconstruction aloft
 UPPER_TAPER_MODE = "climatology"
 UPPER_TAPER_START_HPA = 500.0
 UPPER_TAPER_TOP_HPA = 350.0
