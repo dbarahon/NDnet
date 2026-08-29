@@ -1,7 +1,7 @@
 """Utilities for fast repeated site/campaign diagnostics.
 
 The expensive refinement model is independent of the post-inference pressure
-closure.  These helpers therefore cache *raw*, untapered diagnostic products
+closure. These helpers therefore cache *raw*, untapered diagnostic products
 and support inference only on days actually needed by site/campaign
 diagnostics.
 
@@ -11,6 +11,7 @@ No training behavior is changed here.
 from __future__ import annotations
 
 from dataclasses import replace
+import glob
 import os
 import re
 
@@ -21,7 +22,7 @@ import xarray as xr
 import config as cfg
 
 
-CACHE_VERSION = "1"
+CACHE_VERSION = "2"
 
 
 def _safe_token(value):
@@ -151,6 +152,101 @@ def write_diagnostic_cache(ds, kind, model_name):
     print(f"[DIAG-CACHE] wrote raw {kind} diagnostics: {path}")
 
 
+def _resolve_site_nc(var_dir, site, varname, prefix):
+    """Resolve the same per-site input file convention used by data_handling."""
+    if prefix and (("*" in prefix) or ("?" in prefix) or str(prefix).endswith(".nc")):
+        hits = sorted(glob.glob(os.path.join(var_dir, prefix)))
+        if hits:
+            for h in hits:
+                bn = os.path.basename(h)
+                if f".{site}." in bn and f".{varname}." in bn:
+                    return h
+            for h in hits:
+                if f".{site}." in os.path.basename(h):
+                    return h
+            return hits[0]
+
+    if prefix:
+        fn = os.path.join(
+            var_dir,
+            f"Cloudnet.{site}.{varname}.tavg1D.{prefix}.nc",
+        )
+        if os.path.exists(fn):
+            return fn
+
+    hits = sorted(
+        glob.glob(os.path.join(var_dir, f"Cloudnet.{site}.{varname}.tavg1D.*.nc"))
+    )
+    if not hits:
+        raise FileNotFoundError(
+            f"No per-site file for site={site!r}, var={varname!r} under {var_dir}"
+        )
+    return hits[0]
+
+
+def raw_site_observation_day_mask(template_time, site_meta, min_pressure_hpa=250.0):
+    """Return a (time, site) mask from the *unfilled* CloudNet site files.
+
+    The training/projection path fills missing site days before projecting to
+    EOF coefficients. Consequently ``A_sites``/``VS_t`` are intentionally much
+    denser than the actual observations and must not be used to decide which
+    days need NN inference for an observation-only diagnostic.
+
+    This helper reopens only the small per-site CloudNet files, with no dask
+    chunking, and records days having at least ``cfg.min_valid_lev`` finite
+    levels before any filling. Values themselves are not changed or returned.
+    """
+    varname = list(cfg.vars_out.keys())[0]
+    var_dir = cfg.vars_out[varname]
+    prefix = cfg.prefix_sites
+    min_valid_lev = int(getattr(cfg, "min_valid_lev", 1))
+
+    t_template = xr.DataArray(
+        np.asarray(getattr(template_time, "values", template_time)),
+        dims=("time",),
+        name="time",
+    )
+    ntime = t_template.size
+    site_names = np.asarray(site_meta["site"].values)
+    mask = np.zeros((ntime, site_names.size), dtype=bool)
+
+    for si, site in enumerate(site_names):
+        fn = _resolve_site_nc(var_dir, str(site), varname, prefix)
+        try:
+            ds = xr.open_dataset(fn, use_cftime=False)
+        except TypeError:
+            ds = xr.open_dataset(fn)
+
+        try:
+            if varname not in ds:
+                raise KeyError(f"{fn} missing variable {varname!r}")
+
+            obs = ds[varname]
+            if "lev" in obs.dims and "lev" in ds.coords:
+                obs = obs.sel(
+                    lev=ds["lev"].where(ds["lev"] >= float(min_pressure_hpa), drop=True)
+                )
+
+            finite = np.isfinite(obs)
+            if "lev" in finite.dims:
+                valid = finite.sum("lev") >= min_valid_lev
+            else:
+                valid = finite
+
+            # Match the exact daily template used by the base coefficients.
+            valid = valid.astype("uint8").reindex(time=t_template.values, fill_value=0)
+            mask[:, si] = np.asarray(valid.values, dtype=bool)
+        finally:
+            ds.close()
+
+    n_union = int(mask.any(axis=1).sum())
+    print(
+        f"[DIAG-INFER] raw site-observation days: {n_union}/{ntime} "
+        f"across {site_names.size} sites"
+    )
+    return mask
+
+
 def diagnostic_time_indices(
     *,
     all_idx,
@@ -161,10 +257,10 @@ def diagnostic_time_indices(
 ):
     """Return sorted original time indices needed by requested diagnostics.
 
-    Site days are identified from the existing valid-site mask ``VS_t``.
-    Campaign days are identified from ``campaign_bundle.time_counts``.  The
-    result is their union.  If sparse inference is disabled, all days are
-    returned.
+    ``VS_t`` may be either the training-time site-valid array or, preferably
+    for evaluation, the raw observation mask from
+    :func:`raw_site_observation_day_mask`. Campaign days come from
+    ``campaign_bundle.time_counts``. The result is their union.
     """
     all_idx = np.asarray(all_idx, dtype=np.int64)
     if not bool(getattr(cfg, "SPARSE_DIAGNOSTIC_INFERENCE", True)):
@@ -175,13 +271,14 @@ def diagnostic_time_indices(
 
     if need_sites:
         if isinstance(VS_t, torch.Tensor):
-            site_valid = VS_t.any(dim=1).detach().cpu().numpy()
+            arr = VS_t.detach().cpu().numpy().astype(bool)
         else:
-            site_valid = np.asarray(VS_t).astype(bool).any(axis=1)
+            arr = np.asarray(VS_t).astype(bool)
+        site_valid = arr if arr.ndim == 1 else arr.any(axis=1)
         site_idx = all_idx[site_valid[all_idx]]
         selected.append(site_idx)
         print(
-            f"[DIAG-INFER] site-valid days: {site_idx.size}/{all_idx.size}"
+            f"[DIAG-INFER] selected site days: {site_idx.size}/{all_idx.size}"
         )
 
     if need_campaigns:
@@ -215,12 +312,7 @@ def sample_sites_from_sparse_grid(
     full_time_coord,
     mode_coord,
 ):
-    """Sample sparse-day dense predictions at sites into small full-time arrays.
-
-    This avoids expanding the sparse dense prediction back to a full
-    ``(time, mode, lat, lon)`` array.  Only ``(time, mode, site)`` is allocated.
-    Days not inferred remain NaN and are subsequently masked by the site truth.
-    """
+    """Sample sparse-day dense predictions at sites into small full-time arrays."""
     coeffs = np.asarray(coeffs_resid_nn, dtype=np.float32)
     infer_idx = np.asarray(infer_idx, dtype=np.int64)
     if coeffs.shape[0] != infer_idx.size:
@@ -237,7 +329,7 @@ def sample_sites_from_sparse_grid(
     T = len(full_time_coord)
     S = ilat.size
 
-    sampled = coeffs[:, :, ilat, ilon]  # (K, M, S)
+    sampled = coeffs[:, :, ilat, ilon]
     full = np.full((T, M, S), np.nan, dtype=np.float32)
     full[infer_idx, :, :] = sampled
 
@@ -272,13 +364,7 @@ def sample_sites_from_sparse_grid(
 
 
 def remap_campaign_bundle_for_sparse(bundle, infer_idx):
-    """Return a shallow bundle copy whose segment time indices address K predictions.
-
-    ``sample_campaign_from_dense_predictions`` expects its first dimension to
-    be indexed by ``bundle.time_idx``.  Sparse inference stores only K selected
-    days, so remap original day indices to [0, K).  All physical/observational
-    metadata remain unchanged.
-    """
+    """Return a shallow bundle copy whose segment time indices address K predictions."""
     if bundle is None:
         return None
 
