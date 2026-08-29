@@ -38,6 +38,14 @@ if deb > 0:
 sitemaskmode = "obs_dates" # "obs_levels" | "obs_dates" | "none" makes little difference, use dates though
 
 # -------------------------------------------------
+# NetCDF temporary writes
+# -------------------------------------------------
+# safe_to_netcdf() and safe_to_netcdf_chunked() stage files here before
+# moving them to their final path. Use a writable project/scratch directory.
+# An absolute path is also fine, e.g. "/panfs/.../my_scratch/netcdf_tmp".
+NETCDF_TMPDIR = "./temp"
+
+# -------------------------------------------------
 # Fast repeated site/campaign diagnostics
 # -------------------------------------------------
 # The first evaluation run computes the raw (untapered) site/campaign products
