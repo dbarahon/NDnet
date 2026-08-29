@@ -31,39 +31,19 @@ def plot_global_level_comparison(
     """Journal-style global Nd comparison using Base as reference.
 
     The map rows are ordered physically from lower pressure (higher altitude)
-    to higher pressure (lower altitude).  The bottom row is a latitude-pressure
+    to higher pressure (lower altitude). The bottom row is a latitude-pressure
     zonal diagnostic plotted against the actual pressure coordinate, not level
     indices.
-
-    Parameters
-    ----------
-    Nd_base, Nd_nn : xr.DataArray
-        (time, lev, lat, lon)
-    Nd_mean : xr.DataArray
-        Retained for backward compatibility with existing callers.
-    levels : sequence of float
-        Requested pressure levels in hPa. They are displayed in ascending
-        pressure order so altitude decreases from top to bottom.
-    out_png : str
-        Output file.
-    minN : float, optional
-        Minimum Nd used in the comparison. If omitted, cfg.MIN_ND is used.
     """
     if minN is None:
         minN = float(getattr(cfg, "MIN_ND", 1.0))
     else:
         minN = float(minN)
 
-    # ----------------------------
-    # Masking
-    # ----------------------------
     B = Nd_base.where(np.isfinite(Nd_base) & (Nd_base >= minN))
     N = Nd_nn.where(np.isfinite(Nd_nn) & (Nd_nn >= minN))
     N = N.where(np.isfinite(B))
 
-    # ----------------------------
-    # Time means / relative metrics
-    # ----------------------------
     avg_base = B.mean(dim="time", skipna=True)
     avg_nn = N.mean(dim="time", skipna=True)
 
@@ -74,14 +54,8 @@ def plot_global_level_comparison(
         ((N - B) ** 2).mean(dim="time", skipna=True)
     ) / denom
 
-    # ----------------------------
-    # Physical pressure ordering
-    # ----------------------------
     levels_plot = sorted(float(v) for v in levels)
 
-    # ----------------------------
-    # Figure layout
-    # ----------------------------
     proj = ccrs.PlateCarree()
     nmap = len(levels_plot)
     nrows = nmap + 1
@@ -103,9 +77,6 @@ def plot_global_level_comparison(
     for j in range(4):
         axes[nmap, j] = fig.add_subplot(gs[nmap, j])
 
-    # ----------------------------
-    # Color scales
-    # ----------------------------
     Nmin = max(10.0, minN)
     Nmax = 1000.0
     nd_norm = mcolors.LogNorm(vmin=Nmin, vmax=Nmax)
@@ -127,7 +98,6 @@ def plot_global_level_comparison(
         "RMS difference (%)",
     ]
 
-    # Weighted global mean for concise right-side panel annotation.
     def _global_mean(da):
         if "lat" in da.coords:
             w = np.cos(np.deg2rad(da["lat"]))
@@ -137,9 +107,6 @@ def plot_global_level_comparison(
     panel_index = 0
     mappables = [None] * 4
 
-    # ----------------------------
-    # Map panels
-    # ----------------------------
     for i, lev in enumerate(levels_plot):
         base_slice = avg_base.sel(lev=lev, method="nearest")
         nn_slice = avg_nn.sel(lev=lev, method="nearest")
@@ -163,7 +130,6 @@ def plot_global_level_comparison(
             ax.add_feature(cfeature.BORDERS, linewidth=0.35)
             ax.set_global()
 
-            # Keep tick marks on every map but avoid repeated interior labels.
             xticks = [-120, -60, 0, 60, 120]
             yticks = [-60, -30, 0, 30, 60]
             ax.set_xticks(xticks, crs=proj)
@@ -201,9 +167,6 @@ def plot_global_level_comparison(
                     pad=16,
                 )
 
-    # ----------------------------
-    # Zonal diagnostics, using actual pressure coordinates
-    # ----------------------------
     row = nmap
 
     zonal_base = avg_base.mean(dim="lon", skipna=True).transpose("lev", "lat")
@@ -232,7 +195,6 @@ def plot_global_level_comparison(
         )
         mappables[j] = im
 
-        # Pressure increases downward: high altitude at top, surfaceward at bottom.
         ax.set_ylim(p_hi, p_lo)
         ax.set_yticks(p_ticks)
         ax.set_xlim(float(np.nanmin(lat_vals)), float(np.nanmax(lat_vals)))
@@ -251,7 +213,6 @@ def plot_global_level_comparison(
         panel_index += 1
         ax.set_title(f"({letter}) Zonal mean", loc="left", fontsize=9, pad=3)
 
-    # One compact colorbar per column, shared by map and zonal panels.
     for j in range(4):
         cb = fig.colorbar(
             mappables[j],
@@ -272,8 +233,13 @@ def plot_global_level_comparison(
 
 
 def plot_vertical_profiles_sites(Nd_true_s, Nd_base_s, Nd_nn_s, out_png, min_samples=2, max_per_row=5):
-    valid_t_site = xr.ufuncs.isfinite(Nd_true_s).any("lev")   # (time, site)
-    counts = valid_t_site.sum("time").values                  # (site,)
+    """Plot site profiles using exactly the same dates for Obs, Base, and NN."""
+    valid_true = np.isfinite(Nd_true_s).any("lev")
+    valid_base = np.isfinite(Nd_base_s).any("lev")
+    valid_nn = np.isfinite(Nd_nn_s).any("lev")
+    valid_t_site = valid_true & valid_base & valid_nn
+
+    counts = valid_t_site.sum("time").values
     keep_idx = np.where(counts >= min_samples)[0]
 
     if keep_idx.size == 0:
@@ -297,9 +263,8 @@ def plot_vertical_profiles_sites(Nd_true_s, Nd_base_s, Nd_nn_s, out_png, min_sam
 
     for k, sidx in enumerate(keep_idx):
         ax = axes_flat[k]
-        vmask = valid_t_site[:, sidx]  # (time,)
+        vmask = valid_t_site[:, sidx]
 
-        # Mean + std across time, masking invalid times
         Tm = Nd_true_s[:, :, sidx].where(vmask).mean("time")
         Ts = Nd_true_s[:, :, sidx].where(vmask).std("time")
         Bm = Nd_base_s[:, :, sidx].where(vmask).mean("time")
@@ -307,17 +272,14 @@ def plot_vertical_profiles_sites(Nd_true_s, Nd_base_s, Nd_nn_s, out_png, min_sam
         Nm = Nd_nn_s[:, :, sidx].where(vmask).mean("time")
         Ns = Nd_nn_s[:, :, sidx].where(vmask).std("time")
 
-        # Convert to numpy
         Tm, Ts = Tm.values, Ts.values
         Bm, Bs = Bm.values, Bs.values
         Nm, Ns = Nm.values, Ns.values
 
-        # Lines
         ax.plot(Tm, lev_vals, "k", lw=2, label="Obs")
         ax.plot(Bm, lev_vals, "b--", lw=1.8, label="Base")
         ax.plot(Nm, lev_vals, "r", lw=2, label="NN")
 
-        # ±1σ shading (horizontal fill vs y=lev)
         ax.fill_betweenx(lev_vals, Tm - Ts, Tm + Ts, color="k", alpha=0.15)
         ax.fill_betweenx(lev_vals, Bm - Bs, Bm + Bs, color="b", alpha=0.12)
         ax.fill_betweenx(lev_vals, Nm - Ns, Nm + Ns, color="r", alpha=0.12)
@@ -333,10 +295,8 @@ def plot_vertical_profiles_sites(Nd_true_s, Nd_base_s, Nd_nn_s, out_png, min_sam
         else:
             ax.set_title(name, fontsize=9)
 
-        # Force pressure orientation
         ax.set_ylim(y_bottom, y_top)
 
-    # Turn off unused axes
     for j in range(n, nrows * ncols):
         axes_flat[j].axis("off")
 
@@ -352,29 +312,16 @@ def plot_vertical_profiles_sites(Nd_true_s, Nd_base_s, Nd_nn_s, out_png, min_sam
 
 ###########################################################
 def plot_global_level_sigma_inference(
-    sigmaNd_nn,     # xr.DataArray (time, lev, lat, lon)
-    Nd_mean,        # xr.DataArray (lev)  (only used for lev ticks)
-    levels,         # list of hPa levels to map
+    sigmaNd_nn,
+    Nd_mean,
+    levels,
     out_png,
-    minSig=1e-6,    # mask tiny/invalid sigma
+    minSig=1e-6,
 ):
-    """
-    Inference-only sigma diagnostic:
-      - Maps: time-mean sigmaNd_nn at requested levels
-      - Zonal diagnostic: lon-mean (time-mean) sigma as (lev x lat) heatmap
-
-    Produces (len(levels) + 1) rows x 1 column.
-    """
-    # ----------------------------
-    # Masking + time mean
-    # ----------------------------
     S = sigmaNd_nn.where(np.isfinite(sigmaNd_nn))
     S = S.where(S >= minSig)
-    avg_sig = S.mean(dim="time", skipna=True)  # (lev, lat, lon)
+    avg_sig = S.mean(dim="time", skipna=True)
 
-    # ----------------------------
-    # Figure layout
-    # ----------------------------
     proj = ccrs.PlateCarree()
     nrows = len(levels) + 1
 
@@ -393,10 +340,6 @@ def plot_global_level_sigma_inference(
         axes.append(fig.add_subplot(gs[i, 0], projection=proj))
     ax_zonal = fig.add_subplot(gs[nrows - 1, 0])
 
-    # ----------------------------
-    # Color scale (log)
-    # ----------------------------
-    # Robust bounds from data
     svals = avg_sig.values
     finite = np.isfinite(svals) & (svals > 0)
     if np.any(finite):
@@ -412,9 +355,6 @@ def plot_global_level_sigma_inference(
     log_norm = mcolors.LogNorm(vmin=vmin, vmax=vmax)
     shk = 0.55
 
-    # ----------------------------
-    # Map panels
-    # ----------------------------
     for ax, lev in zip(axes, levels):
         sig_slice = avg_sig.sel(lev=lev)
 
@@ -430,10 +370,7 @@ def plot_global_level_sigma_inference(
         ax.set_title(f"Time-mean $\\sigma_{{Nd}}$ (NN) @ {lev} hPa")
         fig.colorbar(im, ax=ax, shrink=shk, label=r"$\sigma_{Nd}$")
 
-    # ----------------------------
-    # Zonal diagnostic (lev x lat)
-    # ----------------------------
-    zonal_sig = avg_sig.mean(dim="lon", skipna=True)  # (lev, lat)
+    zonal_sig = avg_sig.mean(dim="lon", skipna=True)
 
     Z = zonal_sig.values
     imz = ax_zonal.imshow(
@@ -445,7 +382,6 @@ def plot_global_level_sigma_inference(
     )
     fig.colorbar(imz, ax=ax_zonal, shrink=0.9, label=r"$\sigma_{Nd}$ (zonal)")
 
-    # axis ticks: pressure
     p_lev = Nd_mean.lev.values
     p_ticks = np.array([1000, 850, 700, 500, 300, 200])
     yticks = [int(np.argmin(np.abs(p_lev - p))) for p in p_ticks]
@@ -455,9 +391,7 @@ def plot_global_level_sigma_inference(
     ax_zonal.set_yticklabels(ylabels)
     ax_zonal.set_ylabel("Pressure (hPa)")
 
-    # axis ticks: latitude
     lat = zonal_sig["lat"].values
-    # pick a few evenly spaced ticks
     nlt = 7
     idx = np.linspace(0, len(lat) - 1, nlt).astype(int)
     ax_zonal.set_xticks(idx)
@@ -466,16 +400,12 @@ def plot_global_level_sigma_inference(
 
     ax_zonal.set_title(r"Zonal mean of time-mean $\sigma_{Nd}$ (NN)")
 
-    # ----------------------------
-    # Save
-    # ----------------------------
     plt.savefig(out_png, dpi=120, bbox_inches="tight")
     plt.close(fig)
 
 
 # ============================================================
 # Campaign scatter diagnostics
-# Append to plotting.py
 # ============================================================
 
 
@@ -521,19 +451,6 @@ def _campaign_subset(
 
 
 def _campaign_ds_to_dfs(dsC):
-    """
-    Convert campaign diagnostics dataset to one DataFrame per campaign.
-
-    Expected variables in dsC:
-      Nd_obs        (segment)
-      Nd_nn         (segment)
-      Nd_base       (segment) optional
-      sigma_nn      (segment) optional
-      p_merra       (segment)
-      time          (segment)
-      campaign      (segment)   string coord or variable
-      modis_ok      (segment)   optional
-    """
     if "campaign" in dsC.coords:
         campaign_vals = np.asarray(dsC["campaign"].values).astype("U")
     elif "campaign" in dsC:
@@ -580,24 +497,12 @@ def plot_campaign_scatter_panels(
     xlim=None,
     ylim=None,
 ):
-    """
-    One panel per campaign.
-    X axis: observed Nd
-    Y axis: model Nd
-
-    If base_col exists, plot both:
-      - base in gray open circles
-      - NN in colored filled circles by pressure
-
-    Title shows per-campaign stats for available series.
-    """
     dfs = _campaign_ds_to_dfs(dsC)
     n = len(dfs)
     if n == 0:
         print("[INFO] No campaigns found; skipping campaign scatter plot.")
         return
 
-    # global limits
     vals = []
     for df in dfs:
         sub_nn = _campaign_subset(
@@ -640,7 +545,6 @@ def plot_campaign_scatter_panels(
     else:
         ylo, yhi = ylim
 
-    # pressure range for nn coloring
     p_all = []
     for df in dfs:
         sub = _campaign_subset(
@@ -667,7 +571,6 @@ def plot_campaign_scatter_panels(
 
     for ax, df in zip(axes, dfs):
         campaign = str(df["campaign"].iloc[0])
-
         title_bits = []
 
         if base_col in df.columns:
@@ -745,44 +648,19 @@ def plot_campaign_scatter_panels(
 
 ###########################################################
 def plot_global_level_sigma_rel_inference(
-    sigmaNd_nn,     # xr.DataArray (time, lev, lat, lon)
-    Nd_nn,          # xr.DataArray (time, lev, lat, lon)
-    Nd_mean,        # xr.DataArray (lev), only used for pressure ticks
-    levels,         # list of hPa levels to map
+    sigmaNd_nn,
+    Nd_nn,
+    Nd_mean,
+    levels,
     out_png,
-    minSig=1e-6,    # mask tiny/invalid sigma
-    minNd=1.0,      # do not form sigma/Nd where Nd is tiny
-    vmin=0.0,       # relative sigma (%)
-    vmax=100.0,     # relative sigma (%)
+    minSig=1e-6,
+    minNd=1.0,
+    vmin=0.0,
+    vmax=100.0,
 ):
-    """
-    Inference-only relative-sigma diagnostic.
-
-    Computes, point by point:
-
-        relative_sigma = 100 * sigma_Nd / Nd
-
-    before taking temporal/spatial averages.
-
-    Produces:
-      - Maps: time-mean relative sigma at requested levels
-      - Zonal diagnostic: lon-mean of time-mean relative sigma
-        as a (lev x lat) heatmap
-
-    Relative sigma is expressed in percent.
-
-    Produces (len(levels) + 1) rows x 1 column.
-    """
-
-    # ============================================================
-    # Relative uncertainty: 100 * sigmaNd / Nd
-    # ============================================================
-
     S = sigmaNd_nn.where(np.isfinite(sigmaNd_nn))
     N = Nd_nn.where(np.isfinite(Nd_nn))
 
-    # Remove invalid/tiny sigma and very small Nd.
-    # The Nd threshold is important because sigma/Nd diverges as Nd -> 0.
     valid = (
         (S >= minSig)
         & (N >= minNd)
@@ -794,12 +672,7 @@ def plot_global_level_sigma_rel_inference(
     rel = 100.0 * S / N
     rel = rel.where(np.isfinite(rel))
 
-    # Mean of the pointwise relative uncertainty
-    avg_rel = rel.mean(dim="time", skipna=True)   # (lev, lat, lon)
-
-    # ============================================================
-    # Figure layout
-    # ============================================================
+    avg_rel = rel.mean(dim="time", skipna=True)
 
     proj = ccrs.PlateCarree()
     nrows = len(levels) + 1
@@ -826,11 +699,6 @@ def plot_global_level_sigma_rel_inference(
 
     ax_zonal = fig.add_subplot(gs[nrows - 1, 0])
 
-    # ============================================================
-    # Color scale
-    # ============================================================
-
-    # Linear scale is easier to interpret for percentages.
     norm = mcolors.Normalize(
         vmin=vmin,
         vmax=vmax,
@@ -839,14 +707,7 @@ def plot_global_level_sigma_rel_inference(
 
     shk = 0.55
 
-    # ============================================================
-    # Map panels
-    # ============================================================
-
     for ax, lev in zip(axes, levels):
-
-        # nearest makes the function robust to slightly different
-        # pressure coordinates
         rel_slice = avg_rel.sel(
             lev=lev,
             method="nearest",
@@ -880,16 +741,10 @@ def plot_global_level_sigma_rel_inference(
             label=r"$100\,\sigma_{N_d}/N_d$ (%)",
         )
 
-    # ============================================================
-    # Zonal diagnostic
-    # ============================================================
-
-    # First temporal mean already done above.
-    # Now average pointwise relative uncertainty over longitude.
     zonal_rel = avg_rel.mean(
         dim="lon",
         skipna=True,
-    )   # (lev, lat)
+    )
 
     Z = zonal_rel.values
 
@@ -907,10 +762,6 @@ def plot_global_level_sigma_rel_inference(
         shrink=0.9,
         label=r"$100\,\sigma_{N_d}/N_d$ (%)",
     )
-
-    # ============================================================
-    # Pressure-axis ticks
-    # ============================================================
 
     p_lev = Nd_mean.lev.values
 
@@ -937,10 +788,6 @@ def plot_global_level_sigma_rel_inference(
     ax_zonal.set_yticklabels(ylabels)
     ax_zonal.set_ylabel("Pressure (hPa)")
 
-    # ============================================================
-    # Latitude-axis ticks
-    # ============================================================
-
     lat = zonal_rel["lat"].values
 
     nlt = 7
@@ -963,10 +810,6 @@ def plot_global_level_sigma_rel_inference(
         r"Zonal mean relative uncertainty "
         r"$100\,\sigma_{N_d}/N_d$"
     )
-
-    # ============================================================
-    # Save
-    # ============================================================
 
     plt.savefig(
         out_png,
