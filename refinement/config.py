@@ -53,6 +53,12 @@ DIAGNOSTIC_CACHE_DIR = "./cache/diagnostics"
 # requested site/campaign diagnostics. Set False for the legacy all-day pass.
 SPARSE_DIAGNOSTIC_INFERENCE = True
 
+# Use the actual unfilled CloudNet observation dates for the site diagnostic
+# selector. The training/projection target is intentionally filled in time and
+# therefore cannot be used to identify observed days. Set False only if you
+# deliberately want the old dense training-validity behavior.
+SITE_DIAGNOSTIC_OBS_DAYS_ONLY = True
+
 # -------------------------------------------------
 # Plotting thresholds
 # -------------------------------------------------
