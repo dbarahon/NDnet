@@ -48,7 +48,59 @@ def log_train_event(record: dict, write_csv=True, write_jsonl=True):
     if write_csv:
         _append_csv(log_csv, clean)
 
-        
+
+def _netcdf_attr_value(value):
+    """Convert metadata values that netCDF4 cannot store directly."""
+    if isinstance(value, (bool, np.bool_)):
+        return int(value)
+    if isinstance(value, np.generic):
+        value = value.item()
+        if isinstance(value, bool):
+            return int(value)
+        return value
+    if isinstance(value, np.ndarray) and value.dtype.kind == "b":
+        return value.astype(np.int8)
+    if isinstance(value, (list, tuple)) and value:
+        if all(isinstance(v, (bool, np.bool_)) for v in value):
+            return np.asarray(value, dtype=np.int8)
+    return value
+
+
+def _sanitize_netcdf_attrs(ds):
+    """Return a shallow dataset copy with netCDF4-compatible attributes."""
+    out = ds.copy(deep=False)
+    out.attrs = {
+        key: _netcdf_attr_value(value)
+        for key, value in out.attrs.items()
+    }
+    for name in out.variables:
+        if out[name].attrs:
+            out[name].attrs = {
+                key: _netcdf_attr_value(value)
+                for key, value in out[name].attrs.items()
+            }
+    return out
+
+
+def _netcdf_tmpdir(out_dir):
+    """Resolve and create the configured temporary NetCDF directory."""
+    try:
+        import config as cfg
+        configured = getattr(cfg, "NETCDF_TMPDIR", None)
+    except Exception:
+        configured = None
+
+    # Explicit project config takes precedence. SLURM_TMPDIR remains a useful
+    # fallback for other scripts that import this utility without the setting.
+    tmpdir = configured or os.environ.get("SLURM_TMPDIR") or out_dir
+    tmpdir = os.path.abspath(os.path.expanduser(str(tmpdir)))
+    os.makedirs(tmpdir, exist_ok=True)
+
+    if not os.access(tmpdir, os.W_OK):
+        raise PermissionError(f"NetCDF temporary directory is not writable: {tmpdir}")
+    return tmpdir
+
+
 def safe_to_netcdf_chunked(
     ds,
     path,
@@ -65,19 +117,16 @@ def safe_to_netcdf_chunked(
     out_dir = os.path.dirname(path) or "."
     os.makedirs(out_dir, exist_ok=True)
 
-    # write to local scratch first
-    #tmpdir = os.environ.get("SLURM_TMPDIR", "/temp")
-    tmpdir =  "./temp"
+    tmpdir = _netcdf_tmpdir(out_dir)
     tmp_path = os.path.join(tmpdir, os.path.basename(path) + ".tmp")
 
-    # Ensure float32 and reasonable chunking on-disk
-    ds2 = ds.copy()
+    # Ensure NetCDF-compatible metadata, float32 and reasonable disk chunking.
+    ds2 = _sanitize_netcdf_attrs(ds)
     for v in ds2.data_vars:
         if ds2[v].dtype.kind == "f":
             ds2[v] = ds2[v].astype("float32")
 
     # Rechunk for IO (important)
-    # You can tune these; below keeps whole lat/lon planes and chunks in time.
     ds2 = ds2.chunk({"time": chunk_t, "lev": chunk_lev, "lat": chunk_lat, "lon": chunk_lon})
 
     encoding = {}
@@ -105,6 +154,7 @@ def safe_to_netcdf_chunked(
 
     print(f"[NETCDF] Moving to final: {path}", flush=True)
     shutil.move(tmp_path, path)
+
 
 def save_vis_nc(path, da, time_slice=None, modes=None, stride_lat=1, stride_lon=1):
     da_vis = da
@@ -159,19 +209,29 @@ def safe_to_netcdf(ds, path, engine="netcdf4"):
     out_dir = os.path.dirname(path) or "."
     os.makedirs(out_dir, exist_ok=True)
 
+    # Work on a shallow copy so diagnostics passed by the caller are not
+    # modified merely because they are being written.
+    ds_work = _sanitize_netcdf_attrs(ds)
+
     # cast floats to float32 to reduce IO
-    for v in ds.data_vars:
-        if ds[v].dtype.kind == "f":
-            ds[v] = ds[v].astype("float32")
+    for v in ds_work.data_vars:
+        if ds_work[v].dtype.kind == "f":
+            ds_work[v] = ds_work[v].astype("float32")
 
     # 1) force compute in a controlled way
     print(f"[NETCDF] Computing dataset in memory before writing: {path}", flush=True)
     with ProgressBar():
-        ds2 = ds.load()
+        ds2 = ds_work.load()
 
-    # 2) write to local scratch first, then move
-    tmpdir = os.environ.get("SLURM_TMPDIR", "/tmp")
+    # 2) write to configured scratch first, then move
+    tmpdir = _netcdf_tmpdir(out_dir)
     tmp_path = os.path.join(tmpdir, os.path.basename(path) + ".tmp")
+
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except Exception:
+        pass
 
     print(f"[NETCDF] Writing to temp: {tmp_path}", flush=True)
     ds2.to_netcdf(tmp_path, engine=engine, format="NETCDF4")
@@ -233,7 +293,6 @@ def shift_lon(lon):
 # ============================================================
 # TIME UTILITIES
 # ============================================================
-
 def force_datetime64_ns(t):
     """
     Convert any time array to datetime64[ns].
@@ -316,11 +375,11 @@ def tensorize_sites_inputs_v2(
     """
     Returns:
       X2d_t : torch.float32 [T, C, H, W]
-      MU0_t : torch.float32 [T, M, H, W]
-      YS_t  : torch.float32 [T, M, S]
-      VS_t  : torch.bool    [T, S]
-      Nds   : torch.float32 [T, Z, S]
-      Eds   : torch.float32 [T, Z, S]
+      MU0_t : torch.float32 [T, M,H,W]
+      YS_t  : torch.float32 [T,M,S]
+      VS_t  : torch.bool    [T,S]
+      Nds   : torch.float32 [T,Z,S]
+      Eds   : torch.float32 [T,Z,S]
     """
 
     # ---- X2D (time, lat, lon, var) -> [T,C,H,W] ----
