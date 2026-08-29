@@ -252,8 +252,19 @@ def finalize_nd_product(
     return ds
 
 
-def load_site_campaign_state(need_campaign_bundle=False):
-    """Load the common site/campaign data only when a raw cache is unavailable."""
+def load_site_campaign_state(
+    need_campaign_bundle=False,
+    *,
+    evaluation_only=False,
+    need_sites=False,
+    need_campaigns=False,
+):
+    """Load site/campaign data, subsetting dense tensors before materialization.
+
+    Training keeps the historical full-period tensorization.  Evaluation-only
+    sparse diagnostics first identify the union of site/campaign observation
+    days, then materialize MODIS/base tensors only for those days.
+    """
     Nin_2d, A_sites, Nd_sites, Err_sites, Ares_base, site_meta = get_data(
         vars_out=vars_out,
         pth_all=pth_all,
@@ -266,16 +277,6 @@ def load_site_campaign_state(need_campaign_bundle=False):
         site_json_path=SITE_JSON,
     )
 
-    X2d_t, MU0_t, YS_t, VS_t, Nds, Eds = tensorize_sites_inputs_v2(
-        Nin_2d=Nin_2d,
-        A_sites=A_sites,
-        Ares_base=Ares_base,
-        Nd_sites=Nd_sites,
-        Err_sites=Err_sites,
-        pin_memory=True,
-        verbose=True,
-    )
-
     nt = Nin_2d.sizes["time"]
     all_idx = np.arange(nt, dtype=np.int64)
 
@@ -284,6 +285,8 @@ def load_site_campaign_state(need_campaign_bundle=False):
     campaign_train_dir = getattr(cfg, "CAMPAIGN_TRAIN_DIR", None)
     campaign_pattern = getattr(cfg, "CAMPAIGN_PATTERN", "*_training.nc")
 
+    # Load campaign metadata before choosing diagnostic days so campaign-only
+    # days can be included in the sparse inference union.
     if need_campaign_bundle and campaign_train_dir:
         campaign_ds = load_campaign_training_files(
             campaign_train_dir=campaign_train_dir,
@@ -297,6 +300,57 @@ def load_site_campaign_state(need_campaign_bundle=False):
             pin_memory=True,
             verbose=True,
         )
+
+    tensor_time_idx = all_idx
+    tensors_sparse = False
+
+    if evaluation_only and bool(getattr(cfg, "SPARSE_DIAGNOSTIC_INFERENCE", True)):
+        # A_sites is already a small (time, mode, site) product at this point.
+        # Derive the site-valid mask here instead of first materializing the
+        # enormous global MODIS/base tensors via tensorize_sites_inputs_v2().
+        if need_sites:
+            site_valid = np.isfinite(np.asarray(A_sites.values)).any(axis=1)
+        else:
+            site_valid = np.zeros((nt, 1), dtype=bool)
+
+        tensor_time_idx = diagnostic_time_indices(
+            all_idx=all_idx,
+            VS_t=site_valid,
+            campaign_bundle=camp_bundle,
+            need_sites=need_sites,
+            need_campaigns=need_campaigns,
+        )
+        if tensor_time_idx.size == 0:
+            raise RuntimeError("No site/campaign days selected for diagnostic tensorization")
+
+        tensors_sparse = tensor_time_idx.size < all_idx.size
+        print(
+            f"[DIAG-LOAD] tensorizing {tensor_time_idx.size}/{all_idx.size} days "
+            "before NumPy/PyTorch materialization"
+        )
+
+    if tensors_sparse:
+        Nin_tensor = Nin_2d.isel(time=tensor_time_idx)
+        A_sites_tensor = A_sites.isel(time=tensor_time_idx)
+        Ares_tensor = Ares_base.isel(time=tensor_time_idx)
+        Nd_sites_tensor = Nd_sites.isel(time=tensor_time_idx)
+        Err_sites_tensor = Err_sites.isel(time=tensor_time_idx)
+    else:
+        Nin_tensor = Nin_2d
+        A_sites_tensor = A_sites
+        Ares_tensor = Ares_base
+        Nd_sites_tensor = Nd_sites
+        Err_sites_tensor = Err_sites
+
+    X2d_t, MU0_t, YS_t, VS_t, Nds, Eds = tensorize_sites_inputs_v2(
+        Nin_2d=Nin_tensor,
+        A_sites=A_sites_tensor,
+        Ares_base=Ares_tensor,
+        Nd_sites=Nd_sites_tensor,
+        Err_sites=Err_sites_tensor,
+        pin_memory=True,
+        verbose=True,
+    )
 
     return {
         "Nin_2d": Nin_2d,
@@ -312,26 +366,45 @@ def load_site_campaign_state(need_campaign_bundle=False):
         "Nds": Nds,
         "Eds": Eds,
         "all_idx": all_idx,
+        "tensor_time_idx": np.asarray(tensor_time_idx, dtype=np.int64),
+        "tensors_sparse": bool(tensors_sparse),
         "campaign_ds": campaign_ds,
         "camp_bundle": camp_bundle,
     }
 
 
 def make_full_loader(state, time_idx=None):
-    if time_idx is None:
-        time_idx = state["all_idx"]
-    time_idx = np.asarray(time_idx, dtype=np.int64)
+    if bool(state.get("tensors_sparse", False)):
+        # Tensors have already been compacted to the selected diagnostic days.
+        # Use local [0,K) indices and omit campaign metadata: inference only
+        # consumes x2d and mu0, while campaign sampling happens afterward with
+        # the original full-period bundle and explicit time-index remapping.
+        local_idx = np.arange(state["X2d_t"].shape[0], dtype=np.int64)
+        full_ds = EOFNdMultiObsDatasetTorch(
+            X2d_t=state["X2d_t"],
+            MU0_t=state["MU0_t"],
+            YS_t=state["YS_t"],
+            VS_t=state["VS_t"],
+            Nds_t=state["Nds"],
+            Eds_t=state["Eds"],
+            campaign_bundle=None,
+            time_idx=local_idx,
+        )
+    else:
+        if time_idx is None:
+            time_idx = state["all_idx"]
+        time_idx = np.asarray(time_idx, dtype=np.int64)
+        full_ds = EOFNdMultiObsDatasetTorch(
+            X2d_t=state["X2d_t"],
+            MU0_t=state["MU0_t"],
+            YS_t=state["YS_t"],
+            VS_t=state["VS_t"],
+            Nds_t=state["Nds"],
+            Eds_t=state["Eds"],
+            campaign_bundle=state["camp_bundle"],
+            time_idx=time_idx,
+        )
 
-    full_ds = EOFNdMultiObsDatasetTorch(
-        X2d_t=state["X2d_t"],
-        MU0_t=state["MU0_t"],
-        YS_t=state["YS_t"],
-        VS_t=state["VS_t"],
-        Nds_t=state["Nds"],
-        Eds_t=state["Eds"],
-        campaign_bundle=state["camp_bundle"],
-        time_idx=time_idx,
-    )
     return DataLoader(
         full_ds,
         batch_size=hp["batch_sz"],
@@ -524,13 +597,21 @@ def dense_inference_for_diagnostics(
     need_sites,
     need_campaigns,
 ):
-    infer_idx = diagnostic_time_indices(
-        all_idx=state["all_idx"],
-        VS_t=state["VS_t"],
-        campaign_bundle=state["camp_bundle"],
-        need_sites=need_sites,
-        need_campaigns=need_campaigns,
-    )
+    if bool(state.get("tensors_sparse", False)):
+        infer_idx = np.asarray(state["tensor_time_idx"], dtype=np.int64)
+        print(
+            f"[DIAG-INFER] using pre-subset tensors: "
+            f"{infer_idx.size}/{state['all_idx'].size} days"
+        )
+    else:
+        infer_idx = diagnostic_time_indices(
+            all_idx=state["all_idx"],
+            VS_t=state["VS_t"],
+            campaign_bundle=state["camp_bundle"],
+            need_sites=need_sites,
+            need_campaigns=need_campaigns,
+        )
+
     if infer_idx.size == 0:
         raise RuntimeError("No site/campaign days selected for diagnostic inference")
 
@@ -540,7 +621,10 @@ def dense_inference_for_diagnostics(
         return coeffs, None, infer_idx
 
     model.eval()
-    loader = make_full_loader(state, time_idx=infer_idx)
+    loader = make_full_loader(
+        state,
+        time_idx=None if bool(state.get("tensors_sparse", False)) else infer_idx,
+    )
     with torch.no_grad():
         coeffs, sig = run_infer_x_mu0(device, loader, model)
     return coeffs, sig, infer_idx
@@ -748,9 +832,6 @@ def run_campaign_diagnostics(
 
     print("=========== campaign evaluation ===========")
 
-    # The sparse NN arrays are indexed [0, K), while the campaign bundle keeps
-    # original full-period time indices. Remap a shallow bundle copy only for
-    # sampling; the original metadata and reported time_idx remain unchanged.
     sparse_bundle = remap_campaign_bundle_for_sparse(camp_bundle, infer_idx)
 
     dsC_nn = sample_campaign_from_dense_predictions(
@@ -762,8 +843,6 @@ def run_campaign_diagnostics(
         A_mean=A_mean,
     )
 
-    # Base is sampled from the same sparse set of required days. This changes
-    # no values; it only avoids materializing the full dense base period.
     base_sparse = state["Ares_base"].isel(time=infer_idx).values.astype(np.float32)
     dsC_base = sample_campaign_from_dense_predictions(
         coeffs_resid_nn=base_sparse,
@@ -1018,11 +1097,6 @@ if __name__ == "__main__":
         print("[MODE] training and sigma fine tuning are disabled")
         print(f"[MODE] evaluation model = {run_model_name}")
 
-    # ------------------------------------------------------------
-    # Reuse raw site/campaign diagnostics whenever possible.
-    # Taper settings are deliberately NOT part of the cache signature because
-    # changing the taper is exactly the use case for this cache.
-    # ------------------------------------------------------------
     site_cache_hit = False
     campaign_cache_hit = False
     if not do_train:
@@ -1048,20 +1122,18 @@ if __name__ == "__main__":
     state = None
     model = None
 
-    # Training always needs the campaign bundle when campaign files are
-    # configured because campaigns are part of the loss. Evaluation loads it
-    # only when campaign cache is missing.
     if do_train or need_sites_compute or need_campaigns_compute:
         state = load_site_campaign_state(
-            need_campaign_bundle=bool(do_train or need_campaigns_compute)
+            need_campaign_bundle=bool(do_train or need_campaigns_compute),
+            evaluation_only=not bool(do_train),
+            need_sites=need_sites_compute,
+            need_campaigns=need_campaigns_compute,
         )
 
     if do_train:
         model, run_model_name = train_refinement_model(
             state, device, numgpu, numwork
         )
-        # A newly trained model must generate fresh raw diagnostics; old cache
-        # hits were intentionally ignored above.
         need_sites_compute = bool(do_sites)
         need_campaigns_compute = bool(do_campaigns)
     elif need_sites_compute or need_campaigns_compute:
