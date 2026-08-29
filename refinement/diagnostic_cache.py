@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import glob
+import json
 import os
 import re
 
@@ -23,6 +24,7 @@ import config as cfg
 
 
 CACHE_VERSION = "2"
+_RAW_SITE_MASK_CACHE = {}
 
 
 def _safe_token(value):
@@ -184,30 +186,90 @@ def _resolve_site_nc(var_dir, site, varname, prefix):
     return hits[0]
 
 
-def raw_site_observation_day_mask(template_time, site_meta, min_pressure_hpa=250.0):
+def _site_names_from_catalog(path):
+    names = []
+    if str(path).endswith(".jsonl"):
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                if "site" in d:
+                    names.append(str(d["site"]))
+    else:
+        with open(path, "r") as f:
+            obj = json.load(f)
+        names.extend(str(k) for k in obj.keys())
+    return np.asarray(names, dtype="U")
+
+
+def _time_values_from_files(files):
+    times = []
+    for fn in files:
+        try:
+            ds = xr.open_dataset(fn, use_cftime=False)
+        except TypeError:
+            ds = xr.open_dataset(fn)
+        try:
+            if "time" in ds.coords and ds.sizes.get("time", 0) > 0:
+                times.append(np.asarray(ds["time"].values).astype("datetime64[ns]"))
+        finally:
+            ds.close()
+    if not times:
+        return np.empty((0,), dtype="datetime64[ns]")
+    return np.unique(np.concatenate(times).astype("datetime64[ns]"))
+
+
+def _diagnostic_template_time_from_config():
+    """Reconstruct the same dense daily time intersection used by get_data()."""
+    base_var = list(cfg.vars_out.keys())[1]
+    base_pattern = os.path.join(cfg.vars_out[base_var], str(cfg.prefix_dense))
+    base_files = sorted(glob.glob(base_pattern))
+    if not base_files:
+        raise FileNotFoundError(f"No base files matching {base_pattern}")
+    t_base = _time_values_from_files(base_files)
+
+    modis_pattern = os.path.join(
+        str(cfg.pth_all),
+        "dailies",
+        str(cfg.modis_source),
+        "on_Noutgrid",
+        f"{cfg.modis_source}.{cfg.prefix_dense}.nc",
+    )
+    modis_files = sorted(glob.glob(modis_pattern))
+    if modis_files:
+        t_modis = _time_values_from_files(modis_files)
+        if t_modis.size:
+            t_base = np.intersect1d(t_base, t_modis)
+
+    return np.asarray(t_base, dtype="datetime64[ns]")
+
+
+def raw_site_observation_day_mask(template_time, site_meta=None, min_pressure_hpa=250.0):
     """Return a (time, site) mask from the *unfilled* CloudNet site files.
 
     The training/projection path fills missing site days before projecting to
     EOF coefficients. Consequently ``A_sites``/``VS_t`` are intentionally much
     denser than the actual observations and must not be used to decide which
     days need NN inference for an observation-only diagnostic.
-
-    This helper reopens only the small per-site CloudNet files, with no dask
-    chunking, and records days having at least ``cfg.min_valid_lev`` finite
-    levels before any filling. Values themselves are not changed or returned.
     """
     varname = list(cfg.vars_out.keys())[0]
     var_dir = cfg.vars_out[varname]
     prefix = cfg.prefix_sites
     min_valid_lev = int(getattr(cfg, "min_valid_lev", 1))
 
-    t_template = xr.DataArray(
-        np.asarray(getattr(template_time, "values", template_time)),
-        dims=("time",),
-        name="time",
-    )
+    template_values = np.asarray(
+        getattr(template_time, "values", template_time)
+    ).astype("datetime64[ns]")
+    t_template = xr.DataArray(template_values, dims=("time",), name="time")
     ntime = t_template.size
-    site_names = np.asarray(site_meta["site"].values)
+
+    if site_meta is None:
+        site_names = _site_names_from_catalog(cfg.SITE_JSON)
+    else:
+        site_names = np.asarray(site_meta["site"].values)
+
     mask = np.zeros((ntime, site_names.size), dtype=bool)
 
     for si, site in enumerate(site_names):
@@ -228,12 +290,7 @@ def raw_site_observation_day_mask(template_time, site_meta, min_pressure_hpa=250
                 )
 
             finite = np.isfinite(obs)
-            if "lev" in finite.dims:
-                valid = finite.sum("lev") >= min_valid_lev
-            else:
-                valid = finite
-
-            # Match the exact daily template used by the base coefficients.
+            valid = finite.sum("lev") >= min_valid_lev if "lev" in finite.dims else finite
             valid = valid.astype("uint8").reindex(time=t_template.values, fill_value=0)
             mask[:, si] = np.asarray(valid.values, dtype=bool)
         finally:
@@ -247,6 +304,29 @@ def raw_site_observation_day_mask(template_time, site_meta, min_pressure_hpa=250
     return mask
 
 
+def _raw_site_mask_for_current_config(expected_nt):
+    key = (
+        str(cfg.prefix_dense),
+        str(cfg.prefix_sites),
+        str(cfg.SITE_JSON),
+        int(getattr(cfg, "min_valid_lev", 1)),
+        int(expected_nt),
+    )
+    if key in _RAW_SITE_MASK_CACHE:
+        return _RAW_SITE_MASK_CACHE[key]
+
+    template_time = _diagnostic_template_time_from_config()
+    if template_time.size != int(expected_nt):
+        raise RuntimeError(
+            "Raw site-mask template length does not match aligned diagnostic period: "
+            f"{template_time.size} vs {expected_nt}"
+        )
+
+    mask = raw_site_observation_day_mask(template_time, site_meta=None)
+    _RAW_SITE_MASK_CACHE[key] = mask
+    return mask
+
+
 def diagnostic_time_indices(
     *,
     all_idx,
@@ -257,10 +337,11 @@ def diagnostic_time_indices(
 ):
     """Return sorted original time indices needed by requested diagnostics.
 
-    ``VS_t`` may be either the training-time site-valid array or, preferably
-    for evaluation, the raw observation mask from
-    :func:`raw_site_observation_day_mask`. Campaign days come from
-    ``campaign_bundle.time_counts``. The result is their union.
+    Site diagnostics default to actual unfilled CloudNet observation dates.
+    This is consistent with ``sitemaskmode='obs_dates'`` and avoids treating
+    stochastic fill values used for EOF projection/training as observations.
+    Set ``SITE_DIAGNOSTIC_OBS_DAYS_ONLY=False`` in config to restore the dense
+    training-mask behavior.
     """
     all_idx = np.asarray(all_idx, dtype=np.int64)
     if not bool(getattr(cfg, "SPARSE_DIAGNOSTIC_INFERENCE", True)):
@@ -270,10 +351,25 @@ def diagnostic_time_indices(
     selected = []
 
     if need_sites:
-        if isinstance(VS_t, torch.Tensor):
-            arr = VS_t.detach().cpu().numpy().astype(bool)
+        use_raw_obs = bool(getattr(cfg, "SITE_DIAGNOSTIC_OBS_DAYS_ONLY", True))
+        if use_raw_obs:
+            try:
+                arr = _raw_site_mask_for_current_config(all_idx.size)
+            except Exception as exc:
+                print(
+                    "[DIAG-INFER] WARNING: raw site-day mask failed; "
+                    f"falling back to training validity mask: {exc!r}"
+                )
+                arr = None
         else:
-            arr = np.asarray(VS_t).astype(bool)
+            arr = None
+
+        if arr is None:
+            if isinstance(VS_t, torch.Tensor):
+                arr = VS_t.detach().cpu().numpy().astype(bool)
+            else:
+                arr = np.asarray(VS_t).astype(bool)
+
         site_valid = arr if arr.ndim == 1 else arr.any(axis=1)
         site_idx = all_idx[site_valid[all_idx]]
         selected.append(site_idx)
