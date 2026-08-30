@@ -247,7 +247,7 @@ def power_scaler(ds, nexp):
 
 def linear_scaler(ds, cst):
     func = lambda x, n: x * n
-    return xr.apply_ufunc(func, ds, nexp, dask='parallelized')
+    return xr.apply_ufunc(func, ds, cst, dask='parallelized')
 
 
 def calcRF(ds):
@@ -343,14 +343,14 @@ def tensorize_inputs(
     """
     Returns:
       X2d_t : torch.float32 [T, C, H, W]
-      MU0_t : torch.float32 [T, M, H, W]
+      MU0_t : torch.float32 [T, M,H,W]
     """
 
     # ---- X2D (time, lat, lon, var) -> [T,C,H,W] ----
     varnames = list(Nin_2d.data_vars)
-    X = xr.concat([Nin_2d[v] for v in varnames], dim="channel")  # (channel, time, lat, lon)
-    X = X.transpose("time", "channel", "lat", "lon")            # (time, channel, lat, lon)
-    X_np = np.asarray(X.data, dtype=np.float32)                 # triggers compute if not already
+    X = xr.concat([Nin_2d[v] for v in varnames], dim="channel")
+    X = X.transpose("time", "channel", "lat", "lon")
+    X_np = np.asarray(X.data, dtype=np.float32)
     X2d_t = torch.from_numpy(X_np)
 
     # ---- MU0 (base coeff residuals) -> [T,M,H,W] ----
