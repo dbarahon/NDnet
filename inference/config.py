@@ -22,6 +22,10 @@ END_DATE = "2024-12-31"   # inclusive
 OUTDIR = "./NDnet_infer_daily/"
 os.makedirs(OUTDIR, exist_ok=True)
 
+# Temporary staging directory used by safe_to_netcdf* before moving files to
+# their final location. Set this to any writable scratch/project directory.
+NETCDF_TMPDIR = "./temp"
+
 # -------------------------------------------------
 # Post-inference upper-pressure taper
 # -------------------------------------------------
