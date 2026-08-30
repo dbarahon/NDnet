@@ -65,6 +65,15 @@ def _netcdf_tmpdir(out_dir):
     return tmpdir
 
 
+def _bounded_chunk(requested, actual):
+    """Return a legal positive NetCDF/Dask chunk size for one dimension."""
+    actual = int(actual)
+    requested = int(requested)
+    if actual <= 0:
+        return 1
+    return max(1, min(requested, actual))
+
+
 def safe_to_netcdf_chunked(
     ds,
     path,
@@ -90,24 +99,49 @@ def safe_to_netcdf_chunked(
         if ds2[v].dtype.kind == "f":
             ds2[v] = ds2[v].astype("float32")
 
-    # Rechunk for IO (important)
-    ds2 = ds2.chunk({"time": chunk_t, "lev": chunk_lev, "lat": chunk_lat, "lon": chunk_lon})
+    requested_chunks = {
+        "time": int(chunk_t),
+        "lev": int(chunk_lev),
+        "lat": int(chunk_lat),
+        "lon": int(chunk_lon),
+    }
+
+    # Bound every requested Dask chunk by the actual dimension length.  This is
+    # essential for inference outputs because the pressure subset can contain
+    # fewer than the nominal 22 EOF levels.
+    rechunk = {
+        dim: _bounded_chunk(size, ds2.sizes[dim])
+        for dim, size in requested_chunks.items()
+        if dim in ds2.dims
+    }
+    if rechunk:
+        ds2 = ds2.chunk(rechunk)
 
     encoding = {}
     for v in ds2.data_vars:
+        enc = {}
+        if ds2[v].dtype.kind == "f":
+            enc.update(
+                zlib=True,
+                complevel=int(complevel),
+                shuffle=True,
+            )
+
+        # Only prescribe explicit chunks for the standard Nd 4-D fields. Build
+        # the tuple in the variable's actual dimension order and cap each value
+        # at that variable's dimension size, so NetCDF4 can never receive an
+        # illegal chunksize > dimension size.
         if set(ds2[v].dims) >= {"time", "lev", "lat", "lon"}:
-            encoding[v] = {
-                "zlib": True,
-                "complevel": int(complevel),
-                "shuffle": True,
-                "chunksizes": (chunk_t, chunk_lev, chunk_lat, chunk_lon),
-            }
-        elif ds2[v].dtype.kind == "f":
-            encoding[v] = {
-                "zlib": True,
-                "complevel": int(complevel),
-                "shuffle": True,
-            }
+            enc["chunksizes"] = tuple(
+                _bounded_chunk(
+                    requested_chunks.get(dim, ds2[v].sizes[dim]),
+                    ds2[v].sizes[dim],
+                )
+                for dim in ds2[v].dims
+            )
+
+        if enc:
+            encoding[v] = enc
 
     # Make sure a stale temporary file from a failed run does not block output.
     try:
@@ -116,6 +150,10 @@ def safe_to_netcdf_chunked(
     except Exception:
         pass
 
+    print(
+        f"[NETCDF] dims={dict(ds2.sizes)} rechunk={rechunk}",
+        flush=True,
+    )
     print(f"[NETCDF] Streaming write to temp: {tmp_path}", flush=True)
     with ProgressBar():
         ds2.to_netcdf(
