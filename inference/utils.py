@@ -13,6 +13,58 @@ import dask.array as da
 # Visualization
 # ============================
 
+def _netcdf_attr_value(value):
+    """Convert metadata values that netCDF4 cannot store directly."""
+    if isinstance(value, (bool, np.bool_)):
+        return int(value)
+    if isinstance(value, np.generic):
+        value = value.item()
+        if isinstance(value, bool):
+            return int(value)
+        return value
+    if isinstance(value, np.ndarray) and value.dtype.kind == "b":
+        return value.astype(np.int8)
+    if isinstance(value, (list, tuple)) and value:
+        if all(isinstance(v, (bool, np.bool_)) for v in value):
+            return np.asarray(value, dtype=np.int8)
+    return value
+
+
+def _sanitize_netcdf_attrs(ds):
+    """Return a shallow dataset copy with netCDF4-compatible attributes."""
+    out = ds.copy(deep=False)
+    out.attrs = {
+        key: _netcdf_attr_value(value)
+        for key, value in out.attrs.items()
+    }
+    for name in out.variables:
+        if out[name].attrs:
+            out[name].attrs = {
+                key: _netcdf_attr_value(value)
+                for key, value in out[name].attrs.items()
+            }
+    return out
+
+
+def _netcdf_tmpdir(out_dir):
+    """Resolve and create the configured temporary NetCDF directory."""
+    try:
+        import config as cfg
+        configured = getattr(cfg, "NETCDF_TMPDIR", None)
+    except Exception:
+        configured = None
+
+    # Explicit project config takes precedence. SLURM_TMPDIR remains a useful
+    # fallback for other scripts that import this utility without the setting.
+    tmpdir = configured or os.environ.get("SLURM_TMPDIR") or out_dir
+    tmpdir = os.path.abspath(os.path.expanduser(str(tmpdir)))
+    os.makedirs(tmpdir, exist_ok=True)
+
+    if not os.access(tmpdir, os.W_OK):
+        raise PermissionError(f"NetCDF temporary directory is not writable: {tmpdir}")
+    return tmpdir
+
+
 def safe_to_netcdf_chunked(
     ds,
     path,
@@ -23,25 +75,22 @@ def safe_to_netcdf_chunked(
     chunk_lat=181,
     chunk_lon=360,
 ):
-    import os, shutil
+    import shutil
     from dask.diagnostics import ProgressBar
 
     out_dir = os.path.dirname(path) or "."
     os.makedirs(out_dir, exist_ok=True)
 
-    # write to local scratch first
-    #tmpdir = os.environ.get("SLURM_TMPDIR", "/temp")
-    tmpdir =  "./temp"
+    tmpdir = _netcdf_tmpdir(out_dir)
     tmp_path = os.path.join(tmpdir, os.path.basename(path) + ".tmp")
 
-    # Ensure float32 and reasonable chunking on-disk
-    ds2 = ds.copy()
+    # Ensure NetCDF-compatible metadata, float32 and reasonable disk chunking.
+    ds2 = _sanitize_netcdf_attrs(ds)
     for v in ds2.data_vars:
         if ds2[v].dtype.kind == "f":
             ds2[v] = ds2[v].astype("float32")
 
     # Rechunk for IO (important)
-    # You can tune these; below keeps whole lat/lon planes and chunks in time.
     ds2 = ds2.chunk({"time": chunk_t, "lev": chunk_lev, "lat": chunk_lat, "lon": chunk_lon})
 
     encoding = {}
@@ -54,9 +103,13 @@ def safe_to_netcdf_chunked(
                 "chunksizes": (chunk_t, chunk_lev, chunk_lat, chunk_lon),
             }
         elif ds2[v].dtype.kind == "f":
-            encoding[v] = {"zlib": True, "complevel": int(complevel), "shuffle": True}
+            encoding[v] = {
+                "zlib": True,
+                "complevel": int(complevel),
+                "shuffle": True,
+            }
 
-    # Make sure tmp doesn't exist from a crash
+    # Make sure a stale temporary file from a failed run does not block output.
     try:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -65,10 +118,17 @@ def safe_to_netcdf_chunked(
 
     print(f"[NETCDF] Streaming write to temp: {tmp_path}", flush=True)
     with ProgressBar():
-        ds2.to_netcdf(tmp_path, engine=engine, format="NETCDF4", encoding=encoding, compute=True)
+        ds2.to_netcdf(
+            tmp_path,
+            engine=engine,
+            format="NETCDF4",
+            encoding=encoding,
+            compute=True,
+        )
 
     print(f"[NETCDF] Moving to final: {path}", flush=True)
     shutil.move(tmp_path, path)
+
 
 def save_vis_nc(path, da, time_slice=None, modes=None, stride_lat=1, stride_lon=1):
     da_vis = da
@@ -114,28 +174,37 @@ def _to_numpy(data, dtype=None):
     return arr
 
 
-
 def safe_to_netcdf(ds, path, engine="netcdf4"):
-    import os, shutil
+    import shutil
     from dask.diagnostics import ProgressBar
 
     # ensure directory exists
     out_dir = os.path.dirname(path) or "."
     os.makedirs(out_dir, exist_ok=True)
 
+    # Work on a shallow copy so diagnostics passed by the caller are not
+    # modified merely because they are being written.
+    ds_work = _sanitize_netcdf_attrs(ds)
+
     # cast floats to float32 to reduce IO
-    for v in ds.data_vars:
-        if ds[v].dtype.kind == "f":
-            ds[v] = ds[v].astype("float32")
+    for v in ds_work.data_vars:
+        if ds_work[v].dtype.kind == "f":
+            ds_work[v] = ds_work[v].astype("float32")
 
     # 1) force compute in a controlled way
     print(f"[NETCDF] Computing dataset in memory before writing: {path}", flush=True)
     with ProgressBar():
-        ds2 = ds.load()
+        ds2 = ds_work.load()
 
-    # 2) write to local scratch first, then move
-    tmpdir = os.environ.get("SLURM_TMPDIR", "/tmp")
+    # 2) write to configured scratch first, then move
+    tmpdir = _netcdf_tmpdir(out_dir)
     tmp_path = os.path.join(tmpdir, os.path.basename(path) + ".tmp")
+
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except Exception:
+        pass
 
     print(f"[NETCDF] Writing to temp: {tmp_path}", flush=True)
     ds2.to_netcdf(tmp_path, engine=engine, format="NETCDF4")
@@ -144,7 +213,6 @@ def safe_to_netcdf(ds, path, engine="netcdf4"):
     shutil.move(tmp_path, path)
 
 
-    
 def nb(x, prec=2):
     return np.format_float_positional(x, precision=prec)
 
@@ -164,7 +232,6 @@ def corrcoefxy(x, y):
     return ((x - mean_x) * (y - mean_y)).sum() / n / (std_x * std_y)
 
 
-    
 def log1p_scaler(ds):
     return xr.apply_ufunc(np.log1p, ds, dask='parallelized')
 
@@ -180,7 +247,7 @@ def power_scaler(ds, nexp):
 
 def linear_scaler(ds, cst):
     func = lambda x, n: x * n
-    return xr.apply_ufunc(func, ds, cst, dask='parallelized')
+    return xr.apply_ufunc(func, ds, nexp, dask='parallelized')
 
 
 def calcRF(ds):
@@ -192,12 +259,11 @@ def calcRF(ds):
 
 def shift_lon(lon):
     return xr.where(lon > 180., lon - 360., lon)
-    
-    
+
+
 # ============================================================
 # TIME UTILITIES
 # ============================================================
-
 def force_datetime64_ns(t):
     """
     Convert any time array to datetime64[ns].
@@ -268,8 +334,6 @@ def safe_time_intersection(t1, t2):
 # utils_tensorize.py  (or utils.py)
 
 
-
-
 def tensorize_inputs(
     Nin_2d: xr.Dataset,
     Ares_base: xr.DataArray,   # (time, mode, lat, lon) residual coeffs (anchor)
@@ -297,13 +361,14 @@ def tensorize_inputs(
     if pin_memory and torch.cuda.is_available():
         X2d_t = X2d_t.pin_memory()
         MU0_t = MU0_t.pin_memory()
-   
+
     if verbose:
         print("[TENSORIZE v2]")
         print("  X2d_t:", tuple(X2d_t.shape), X2d_t.dtype)
         print("  MU0_t:", tuple(MU0_t.shape), MU0_t.dtype)
 
     return X2d_t, MU0_t
+
 
 def A_sites_from_infer_grid(coeffs_resid_nn, sig_grid, site_meta, time_coord, mode_coord=None):
     """
@@ -374,4 +439,3 @@ def A_sites_from_Ares_base(Ares_base, site_meta):
         A_base_sites = A_base_sites.assign_coords(site=("site", site_meta["site"].values))
 
     return A_base_sites.rename("A_base_sites_resid")
-
