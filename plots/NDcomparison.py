@@ -11,12 +11,14 @@ Columns: Base | MODIS corrected | Refined
 import os
 import glob
 import string
+import argparse
 
 import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import FuncFormatter
 
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -49,8 +51,8 @@ LON_DIM = "lon"
 MIN_ND = 1.
 COLOR_MIN = 5.0
 COLOR_MAX = 500.0
+COLOR_SCALE = "log"          # "log" or "linear"; CLI --color-scale overrides this
 CMAP = "cividis" #"turbo"
-
 DPI = 100
 
 PRESSURE_TICKS = [1000, 850, 700, 500, 300, 200]
@@ -154,18 +156,55 @@ def _lat_weighted_global_mean(field):
     return float(gm.values)
 
 
+def _make_color_norm(color_scale):
+    """Build the requested shared color normalization."""
+    color_scale = str(color_scale).strip().lower()
+
+    if color_scale == "log":
+        if COLOR_MIN <= 0:
+            raise ValueError("COLOR_MIN must be > 0 when COLOR_SCALE='log'.")
+        return mcolors.LogNorm(vmin=COLOR_MIN, vmax=COLOR_MAX)
+
+    if color_scale == "linear":
+        return mcolors.Normalize(vmin=COLOR_MIN, vmax=COLOR_MAX)
+
+    raise ValueError(
+        f"Unknown color scale '{color_scale}'. Use 'log' or 'linear'."
+    )
+
+
+def _configure_colorbar(cbar, color_scale):
+    """Use readable ticks for either logarithmic or linear scaling."""
+    color_scale = str(color_scale).strip().lower()
+
+    if color_scale == "log":
+        # Preserve the existing journal-style log ticks.
+        log_ticks = [10, 20, 50, 100, 200, 500]
+        ticks = [t for t in log_ticks if COLOR_MIN <= t <= COLOR_MAX]
+        if ticks:
+            cbar.set_ticks(ticks)
+    else:
+        # Evenly spaced values across the requested linear range.
+        cbar.set_ticks(np.linspace(COLOR_MIN, COLOR_MAX, 6))
+
+    # Plain-number labels rather than scientific/log notation.
+    cbar.ax.yaxis.set_major_formatter(
+        FuncFormatter(lambda x, pos: f"{x:g}")
+    )
+
+
 # ============================================================
 # PLOTTING
 # ============================================================
 
-def plot_comparison(cases, out_png):
+def plot_comparison(cases, out_png, color_scale=COLOR_SCALE):
     if len(cases) != 3:
         raise ValueError("This layout requires exactly three cases.")
     if len(LEVELS_HPA) != 3:
         raise ValueError("LEVELS_HPA must contain exactly three levels.")
 
     proj = ccrs.PlateCarree()
-    norm = mcolors.LogNorm(vmin=COLOR_MIN, vmax=COLOR_MAX)
+    norm = _make_color_norm(color_scale)
 
     mean_cases = [(label, _time_mean(da)) for label, da in cases]
 
@@ -265,19 +304,6 @@ def plot_comparison(cases, out_png):
                 fontsize=9.5,
                 pad=3,
             )
-            
-            # Keep tick marks everywhere, but labels only on outer panels
-          #  ax.tick_params(
-          #      axis="both",
-          #      which="major",
-          #      labelsize=7,
-          #      length=2.5,
-          #      width=0.6,
-          #      pad=1.5,
-          #      labelleft=(col == 0),
-          #      labelbottom=(row == 2),
-           # )
-            
 
     # --------------------------------------------------------
     # Zonal means
@@ -323,14 +349,14 @@ def plot_comparison(cases, out_png):
         ax.set_xticks([-90, -60, -30, 0, 30, 60, 90])
 
         ax.tick_params(
-                axis="both",
-                which="major",
-                labelsize=7,
-                length=2.5,
-                width=0.6,
-                pad=1.5,
-                labelleft=(col == 0),
-            )
+            axis="both",
+            which="major",
+            labelsize=7,
+            length=2.5,
+            width=0.6,
+            pad=1.5,
+            labelleft=(col == 0),
+        )
 
         ax.set_xlabel("Latitude (deg)", fontsize=8.5, labelpad=2)
 
@@ -345,38 +371,44 @@ def plot_comparison(cases, out_png):
             fontsize=9.5,
             pad=3,
         )
-        
-        
-
-    from matplotlib.ticker import FuncFormatter
 
     cax = fig.add_axes([0.925, 0.12, 0.015, 0.76])
     sm = plt.cm.ScalarMappable(norm=norm, cmap=CMAP)
     sm.set_array([])
 
     cbar = fig.colorbar(sm, cax=cax)
-
-    # More ticks on the logarithmic color scale
-    cbar.set_ticks([10, 20, 50, 100, 200, 500])
-
-    # Plain-number labels instead of 10^1, 10^2, etc.
-    cbar.ax.yaxis.set_major_formatter(
-        FuncFormatter(lambda x, pos: f"{x:g}")
-    )
+    _configure_colorbar(cbar, color_scale)
 
     cbar.set_label(r"$N_d$ (cm$^{-3}$)", fontsize=9)
     cbar.ax.tick_params(labelsize=7, length=2.5, width=0.6)
 
     fig.savefig(out_png, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
-    print(f"[WROTE] {out_png}")
+    print(f"[WROTE] {out_png}  color_scale={color_scale}")
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description="Plot Base/MODIS-corrected/Refined Nd comparison."
+    )
+    parser.add_argument(
+        "--color-scale",
+        choices=("log", "linear"),
+        default=COLOR_SCALE,
+        help=(
+            "Color normalization for all map and zonal-mean panels "
+            f"(default: {COLOR_SCALE})."
+        ),
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = _parse_args()
     opened_datasets = []
 
     try:
@@ -401,7 +433,7 @@ def main():
             ("NDnet (refined)", refined),
         ]
 
-        plot_comparison(cases, OUT_PNG)
+        plot_comparison(cases, OUT_PNG, color_scale=args.color_scale)
 
     finally:
         for ds in opened_datasets:
