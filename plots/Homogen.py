@@ -77,7 +77,7 @@ from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
 # Daily refined NDnet files. Edit if your path differs.
 INPUT_GLOB = (
     "/panfs/ccds02/nobackup/people/dbarahon/NDnet/EOF/inference/"
-    "after_refinement/NDnet_infer_daily/NDnet_infer_2005*.nc4"
+    "after_refinement/taper/NDnet_infer_daily/NDnet_infer_2005*.nc4"
 )
 
 ND_VAR = "NDinc_cf01p"
@@ -90,7 +90,7 @@ LON_DIM = "lon"
 
 # Layers shown as rows in the plot.
 TOP_LEVELS_HPA = [800.0, 700.0, 600.0]
-BOTTOM_LEVEL_HPA = 950.0
+BOTTOM_LEVEL_HPA = 975.0
 
 # A daily layer is accepted only when Nd is finite at every integration node.
 # This avoids silently integrating across missing vertical portions.
@@ -134,7 +134,7 @@ R_COLOR_MAX = 2.0
 # Add/edit ticks after seeing the first output if necessary.
 H_CBAR_TICKS = [0, 10, 20, 30, 40, 50]
 FREQ_CBAR_TICKS = [0, 20, 40, 60, 80, 100]
-R_CBAR_TICKS = [0, 0.5, 1, 1.5, 2, 2.5, 3]
+R_CBAR_TICKS = [0, 0.5, 1, 1.5, 2]
 
 DPI = 150
 LON_TICKS = [-120, -60, 0, 60, 120]
@@ -737,8 +737,8 @@ def plot_climatology(threshold, out_png=OUT_PNG):
         r"Median $R$",
     ]
     right_title_formats = [
-        lambda x: rf"$\langle H\rangle$ = {x:.1f}\%",
-        lambda x: rf"$\langle f\rangle$ = {x:.1f}\%",
+        lambda x: rf"$\langle H\rangle$ = {x:.1f}$\%$",
+        lambda x: rf"$\langle f\rangle$ = {x:.1f}$\%$",
         lambda x: rf"$\langle R\rangle$ = {x:.2f}",
     ]
 
@@ -834,8 +834,8 @@ def plot_climatology(threshold, out_png=OUT_PNG):
     # One horizontal colorbar beneath each column.
     cbar_ticks = [H_CBAR_TICKS, FREQ_CBAR_TICKS, R_CBAR_TICKS]
     cbar_labels = [
-        r"$H$ (\%)",
-        rf"Valid days with $H>{threshold:g}\%$ (\%)",
+        r"$H$ ($\%$)",
+        rf"Days with $H>{threshold:g}\%$ ($\%$)",
         r"$R$",
     ]
 
@@ -869,7 +869,7 @@ def main():
     parser.add_argument(
         "--threshold",
         type=float,
-        default=10.0,
+        default=30.0,
         help="H exceedance threshold in percent for column 2 (default: 10)",
     )
     parser.add_argument(
