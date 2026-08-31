@@ -11,8 +11,7 @@ with one time step per file.
 
 Diagnostics
 -----------
-For each day/grid column and for each layer [p_top, p_bottom],
-with p_bottom fixed at 975 hPa:
+For each day/grid column and for each configured layer [p_top, p_bottom]:
 
     <Nd> = (1 / Delta ln p) integral Nd d ln p
 
@@ -22,9 +21,10 @@ with p_bottom fixed at 975 hPa:
 
     R = sqrt(V) / sqrt(<sigmaNd^2>_lnp)              [-]
 
-The integrals are evaluated with trapezoidal weights in ln(p). If a layer
-boundary does not coincide with a model pressure level, Nd and sigmaNd are
-linearly interpolated in ln(p) to that boundary.
+The top and bottom pressure boundaries are configured independently, one pair
+per plotted row. The integrals are evaluated with trapezoidal weights in ln(p).
+If a layer boundary does not coincide with a model pressure level, Nd and
+sigmaNd are linearly interpolated in ln(p) to that boundary.
 
 Workflow
 --------
@@ -88,9 +88,10 @@ LEV_DIM = "lev"
 LAT_DIM = "lat"
 LON_DIM = "lon"
 
-# Layers shown as rows in the plot.
+# Layers shown as rows in the plot. Entries are paired by index, e.g.
+# TOP_LEVELS_HPA[0] with BOTTOM_LEVELS_HPA[0].
 TOP_LEVELS_HPA = [800.0, 700.0, 600.0]
-BOTTOM_LEVEL_HPA = 975.0
+BOTTOM_LEVELS_HPA = [975.0, 975.0, 975.0]
 
 # A daily layer is accepted only when Nd is finite at every integration node.
 # This avoids silently integrating across missing vertical portions.
@@ -231,6 +232,30 @@ def _pressure_to_hpa(p):
     if np.nanmedian(finite) > 2000.0:
         return p / 100.0
     return p
+
+
+def _configured_layers():
+    """Return validated (top, bottom) pressure pairs from the configuration."""
+    tops = np.asarray(TOP_LEVELS_HPA, dtype=np.float64)
+    bottoms = np.asarray(BOTTOM_LEVELS_HPA, dtype=np.float64)
+
+    if tops.ndim != 1 or bottoms.ndim != 1 or tops.size == 0:
+        raise ValueError("TOP_LEVELS_HPA and BOTTOM_LEVELS_HPA must be non-empty 1-D arrays.")
+    if tops.shape != bottoms.shape:
+        raise ValueError(
+            "TOP_LEVELS_HPA and BOTTOM_LEVELS_HPA must have the same length; "
+            f"got {tops.size} tops and {bottoms.size} bottoms."
+        )
+    if np.any(~np.isfinite(tops)) or np.any(~np.isfinite(bottoms)):
+        raise ValueError("All configured top and bottom pressure levels must be finite.")
+    if np.any(tops >= bottoms):
+        bad = np.where(tops >= bottoms)[0]
+        details = ", ".join(
+            f"row {i}: top={tops[i]:g}, bottom={bottoms[i]:g}" for i in bad
+        )
+        raise ValueError(f"Each layer must satisfy top < bottom; invalid {details}.")
+
+    return list(zip(tops.tolist(), bottoms.tolist()))
 
 
 # ============================================================
@@ -380,9 +405,10 @@ def _create_annual_output(path, year, lat, lon):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     nc = Dataset(_quiet_path(path), "w", format="NETCDF4")
 
+    layers = _configured_layers()
     nlat = len(lat)
     nlon = len(lon)
-    nlayer = len(TOP_LEVELS_HPA)
+    nlayer = len(layers)
 
     nc.createDimension(TIME_DIM, None)
     nc.createDimension("layer", nlayer)
@@ -393,10 +419,15 @@ def _create_annual_output(path, year, lat, lon):
     tvar.units = "days since 1970-01-01 00:00:00"
     tvar.calendar = "proleptic_gregorian"
 
-    lvar = nc.createVariable("layer_top_hpa", "f4", ("layer",))
-    lvar[:] = np.asarray(TOP_LEVELS_HPA, dtype=np.float32)
-    lvar.units = "hPa"
-    lvar.long_name = "top pressure of vertical heterogeneity layer"
+    topvar = nc.createVariable("layer_top_hpa", "f4", ("layer",))
+    topvar[:] = np.asarray([top for top, _ in layers], dtype=np.float32)
+    topvar.units = "hPa"
+    topvar.long_name = "top pressure of vertical heterogeneity layer"
+
+    bottomvar = nc.createVariable("layer_bottom_hpa", "f4", ("layer",))
+    bottomvar[:] = np.asarray([bottom for _, bottom in layers], dtype=np.float32)
+    bottomvar.units = "hPa"
+    bottomvar.long_name = "bottom pressure of vertical heterogeneity layer"
 
     latvar = nc.createVariable(LAT_DIM, "f8", (LAT_DIM,))
     lonvar = nc.createVariable(LON_DIM, "f8", (LON_DIM,))
@@ -440,7 +471,6 @@ def _create_annual_output(path, year, lat, lon):
     )
 
     nc.setncattr("year", int(year))
-    nc.setncattr("bottom_level_hpa", float(BOTTOM_LEVEL_HPA))
     nc.setncattr("integration_coordinate", "ln(pressure)")
     nc.setncattr("boundary_interpolation", "linear in ln(pressure)")
     nc.setncattr("minimum_Nd_cm-3", float(MIN_ND))
@@ -472,9 +502,10 @@ def _process_one_year(year, files):
         lon = np.asarray(nc0.variables[LON_DIM][:], dtype=np.float64)
         p_hpa = _pressure_to_hpa(nc0.variables[LEV_DIM][:])
 
+    layers = _configured_layers()
     specs = [
-        _build_layer_spec(p_hpa, ptop, BOTTOM_LEVEL_HPA)
-        for ptop in TOP_LEVELS_HPA
+        _build_layer_spec(p_hpa, ptop, pbottom)
+        for ptop, pbottom in layers
     ]
 
     os.makedirs(ANNUAL_OUT_DIR, exist_ok=True)
@@ -499,7 +530,7 @@ def _process_one_year(year, files):
                     )
 
             H_day = np.empty(
-                (len(TOP_LEVELS_HPA), len(lat), len(lon)), dtype=np.float32
+                (len(layers), len(lat), len(lon)), dtype=np.float32
             )
             R_day = np.empty_like(H_day)
 
@@ -527,12 +558,13 @@ def _process_one_year(year, files):
 def compute_all_years(workers=N_WORKERS):
     files = _expand_files(INPUT_GLOB)
     grouped = _group_files_by_year(files)
+    layers = _configured_layers()
 
     print(f"Found {len(files)} daily files spanning {len(grouped)} years.")
     print(
         "Layers: "
         + ", ".join(
-            f"{BOTTOM_LEVEL_HPA:g}-{p:g} hPa" for p in TOP_LEVELS_HPA
+            f"{bottom:g}-{top:g} hPa" for top, bottom in layers
         )
     )
 
@@ -597,13 +629,40 @@ def calculate_climatology(threshold):
         lat = np.asarray(first.variables[LAT_DIM][:], dtype=np.float64)
         lon = np.asarray(first.variables[LON_DIM][:], dtype=np.float64)
         tops = np.asarray(first.variables["layer_top_hpa"][:], dtype=np.float64)
-        bottom = float(getattr(first, "bottom_level_hpa"))
 
-        expected_tops = np.asarray(TOP_LEVELS_HPA, dtype=np.float64)
+        # New annual files store one bottom boundary per layer. For backward
+        # compatibility, old files with the former scalar attribute can still
+        # be read when the configured bottoms are all equal to that value.
+        if "layer_bottom_hpa" in first.variables:
+            bottoms = np.asarray(
+                first.variables["layer_bottom_hpa"][:], dtype=np.float64
+            )
+        elif hasattr(first, "bottom_level_hpa"):
+            bottoms = np.full(tops.shape, float(getattr(first, "bottom_level_hpa")))
+        else:
+            raise ValueError(
+                "Annual files contain neither layer_bottom_hpa nor the legacy "
+                "bottom_level_hpa attribute. Recompute the annual files."
+            )
+
+        configured = _configured_layers()
+        expected_tops = np.asarray([top for top, _ in configured], dtype=np.float64)
+        expected_bottoms = np.asarray(
+            [bottom for _, bottom in configured], dtype=np.float64
+        )
+
         if tops.shape != expected_tops.shape or not np.allclose(tops, expected_tops):
             raise ValueError(
                 f"Annual files contain layer tops {tops}, but script expects "
                 f"{expected_tops}."
+            )
+        if (
+            bottoms.shape != expected_bottoms.shape
+            or not np.allclose(bottoms, expected_bottoms)
+        ):
+            raise ValueError(
+                f"Annual files contain layer bottoms {bottoms}, but script expects "
+                f"{expected_bottoms}. Recompute annual files for the configured layers."
             )
 
         ntime = sum(len(nc.dimensions[TIME_DIM]) for nc in datasets)
@@ -623,7 +682,7 @@ def calculate_climatology(threshold):
             f"{threshold:g}%."
         )
 
-        for ilayer, top in enumerate(tops):
+        for ilayer, (top, bottom) in enumerate(zip(tops, bottoms)):
             print(f"Layer {bottom:g}-{top:g} hPa")
 
             for y0 in range(0, nlat, TILE_LAT):
@@ -677,7 +736,7 @@ def calculate_climatology(threshold):
 
                 print(f"  latitude rows {y0:3d}:{y1:3d}", flush=True)
 
-        return lat, lon, tops, bottom, med_H, pct_H_gt, med_R
+        return lat, lon, tops, bottoms, med_H, pct_H_gt, med_R
 
     finally:
         for nc in datasets:
@@ -714,7 +773,7 @@ def _lat_weighted_global_mean(field, lat):
 
 
 def plot_climatology(threshold, out_png=OUT_PNG):
-    lat, lon, tops, bottom, med_H, pct_H_gt, med_R = calculate_climatology(
+    lat, lon, tops, bottoms, med_H, pct_H_gt, med_R = calculate_climatology(
         threshold
     )
 
@@ -759,6 +818,11 @@ def plot_climatology(threshold, out_png=OUT_PNG):
         top=0.93,
     )
 
+    if len(tops) != 3 or len(bottoms) != 3:
+        raise ValueError(
+            "This journal layout currently requires exactly three layer pairs."
+        )
+
     axes = np.empty((3, 3), dtype=object)
     for row in range(3):
         for col in range(3):
@@ -780,7 +844,7 @@ def plot_climatology(threshold, out_png=OUT_PNG):
             clip_on=False,
         )
 
-    for row, top in enumerate(tops):
+    for row, (top, bottom) in enumerate(zip(tops, bottoms)):
         for col in range(3):
             ax = axes[row, col]
             field = data_columns[col][row]
