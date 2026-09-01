@@ -913,8 +913,14 @@ def plot_climatology(threshold, out_png=OUT_PNG):
         cbar.ax.tick_params(labelsize=7, length=2.5, width=0.6, pad=1.5)
 
     fig.savefig(out_png, dpi=DPI, bbox_inches="tight")
-    plt.close(fig)
     print(f"[WROTE] {out_png}")
+
+    out_pdf = os.path.splitext(out_png)[0] + ".pdf"
+    if os.path.abspath(out_pdf) != os.path.abspath(out_png):
+        fig.savefig(out_pdf, bbox_inches="tight")
+        print(f"[WROTE] {out_pdf}")
+
+    plt.close(fig)
 
 
 # ============================================================
