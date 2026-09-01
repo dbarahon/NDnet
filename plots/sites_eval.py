@@ -262,6 +262,42 @@ def pressure_to_hpa(lev):
     return lev
 
 
+def paired_statistics(obs, model):
+    """Return Pearson correlation, mean bias (model - OBS), and sample count."""
+    x = np.asarray(obs, dtype=float).ravel()
+    y = np.asarray(model, dtype=float).ravel()
+
+    good = np.isfinite(x) & np.isfinite(y)
+    x = x[good]
+    y = y[good]
+
+    n = int(x.size)
+    if n == 0:
+        return np.nan, np.nan, 0
+
+    bias = float(np.mean(y - x))
+
+    r = np.nan
+    if n >= 2 and np.std(x) > 0.0 and np.std(y) > 0.0:
+        r = float(np.corrcoef(x, y)[0, 1])
+
+    return r, bias, n
+
+
+def format_panel_statistics(result):
+    """Compact Base/NN statistics for a small multi-panel annotation."""
+    def fmt_r(value):
+        return f"{value:.2f}" if np.isfinite(value) else "--"
+
+    def fmt_b(value):
+        return f"{value:+.1f}" if np.isfinite(value) else "--"
+
+    return (
+        f"B: r={fmt_r(result['prior_r'])}  b={fmt_b(result['prior_bias'])}\n"
+        f"NN: r={fmt_r(result['rec_r'])}  b={fmt_b(result['rec_bias'])}"
+    )
+
+
 def calculate_common_xmax(results, pooled=None):
     """
     Determine a common positive x-axis maximum for all panels.
@@ -457,11 +493,14 @@ def build_statistics(
 
       1. A true pooled profile over all valid (time, site) samples.
       2. One time-mean profile for each site/experiment.
+      3. Per-site Base/NDnet correlation and mean bias against OBS.
 
     Levels with fewer than min_samples valid OBS values are masked.
 
     OBS, ND-prior and NDnet are evaluated over the same OBS-defined
-    sampling so that the comparison remains collocated.
+    sampling so that the comparison remains collocated. Per-site scalar
+    statistics use all collocated (time, pressure) samples at the pressure
+    levels that satisfy the same min_samples criterion used by the plot.
     """
 
     obs, prior, rec = prepare_masked_arrays(
@@ -558,6 +597,22 @@ def build_statistics(
             )
             continue
 
+        # Scalar statistics are based on the same retained pressure levels as
+        # the plotted profile, but use all collocated daily samples rather than
+        # the time-mean profile itself.
+        obs_stats = obs_s.where(enough)
+        prior_stats = prior_s.where(enough)
+        rec_stats = rec_s.where(enough)
+
+        prior_r, prior_bias, prior_n = paired_statistics(
+            obs_stats.values,
+            prior_stats.values,
+        )
+        rec_r, rec_bias, rec_n = paired_statistics(
+            obs_stats.values,
+            rec_stats.values,
+        )
+
         results.append(
             {
                 "site": name,
@@ -600,6 +655,12 @@ def build_statistics(
                     ).where(enough).values,
 
                 "nobs": nobs.values,
+                "prior_r": prior_r,
+                "prior_bias": prior_bias,
+                "prior_n": prior_n,
+                "rec_r": rec_r,
+                "rec_bias": rec_bias,
+                "rec_n": rec_n,
             }
         )
 
@@ -806,6 +867,7 @@ def plot_profiles_by_experiment(
       - shared legend
       - shared x/y labels
       - panel labels (a), (b), ...
+      - compact Base/NN correlation and bias in every panel
       - no redundant interior tick labels
       - common x and y limits
     """
@@ -885,6 +947,25 @@ def plot_profiles_by_experiment(
             loc="left",
             fontsize=7.2,
             pad=2.5,
+        )
+
+        # Compact collocated statistics. Bias is model - OBS in cm^-3.
+        ax.text(
+            0.98,
+            0.98,
+            format_panel_statistics(r),
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=5.4,
+            linespacing=1.05,
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.72,
+                "pad": 0.8,
+            },
+            zorder=10,
         )
 
         row = i // ncol
@@ -985,14 +1066,14 @@ def main():
     # -------------------------------------------------------------
 
     parser.add_argument(
-    "--min_samples",
-    type=int,
-    default=10,
-    help=(
-        "Minimum number of valid OBS samples required at each "
-        "pressure level. Default: 10"
-    ),
-)
+        "--min_samples",
+        type=int,
+        default=10,
+        help=(
+            "Minimum number of valid OBS samples required at each "
+            "pressure level. Default: 10"
+        ),
+    )
 
     parser.add_argument(
         "--indir",
@@ -1178,11 +1259,12 @@ def main():
     # -------------------------------------------------------------
 
     pooled, results = build_statistics(
-    ds,
-    site_names=site_names,
-    minN=args.minN,
-    min_samples=args.min_samples,
-    use_site_mask=not args.ignore_site_mask,)
+        ds,
+        site_names=site_names,
+        minN=args.minN,
+        min_samples=args.min_samples,
+        use_site_mask=not args.ignore_site_mask,
+    )
 
     print(
         f"Valid site/experiment panels: {len(results)}"
