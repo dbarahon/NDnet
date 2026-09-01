@@ -709,14 +709,22 @@ def _pressure_range(dfs, obs_col, model_col, log_axes=False):
     return float(np.nanmin(p_all)), float(np.nanmax(p_all))
 
 
-def _shared_pressure_colorbar(fig, mappable, axes, label="Pressure (hPa)"):
+def _shared_pressure_colorbar(
+    fig,
+    mappable,
+    label="Pressure (hPa)",
+    *,
+    left=0.915,
+    bottom=0.11,
+    top=0.91,
+    width=0.014,
+):
+    """Place a shared vertical colorbar in a dedicated axis outside the grid."""
+    cax = fig.add_axes([left, bottom, width, top - bottom])
     cbar = fig.colorbar(
         mappable,
-        ax=list(axes),
+        cax=cax,
         orientation="vertical",
-        fraction=0.024,
-        pad=0.018,
-        aspect=30,
     )
     cbar.set_label(label, fontsize=7.5)
     cbar.ax.tick_params(labelsize=6.7, width=0.6, length=2.5)
@@ -865,17 +873,27 @@ def plot_timeseries_panel(
         columnspacing=1.6,
     )
 
-    if last_sc is not None:
-        _shared_pressure_colorbar(fig, last_sc, axes[:n])
-
+    # Finalize the subplot grid first, then place the colorbar in the reserved
+    # right margin. This prevents the colorbar from stealing panel width or
+    # overlapping the rightmost column after subplots_adjust().
     fig.subplots_adjust(
         left=0.075,
-        right=0.90,
+        right=0.875,
         bottom=0.075,
         top=0.94,
         wspace=0.20,
         hspace=0.28,
     )
+
+    if last_sc is not None:
+        _shared_pressure_colorbar(
+            fig,
+            last_sc,
+            left=0.905,
+            bottom=0.11,
+            top=0.90,
+            width=0.014,
+        )
 
     save_figure(fig, out_png)
     plt.close(fig)
@@ -978,17 +996,24 @@ def plot_scatter_panel(
     fig.supxlabel(xlabel, fontsize=8.5, y=0.015)
     fig.supylabel(ylabel, fontsize=8.5, x=0.015)
 
-    if last_sc is not None:
-        _shared_pressure_colorbar(fig, last_sc, axes[:n])
-
     fig.subplots_adjust(
         left=0.075,
-        right=0.90,
+        right=0.875,
         bottom=0.065,
         top=0.965,
         wspace=0.12,
         hspace=0.22,
     )
+
+    if last_sc is not None:
+        _shared_pressure_colorbar(
+            fig,
+            last_sc,
+            left=0.905,
+            bottom=0.10,
+            top=0.93,
+            width=0.014,
+        )
 
     save_figure(fig, out_png)
     plt.close(fig)
