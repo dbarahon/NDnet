@@ -19,19 +19,32 @@ Consequences:
 - site and campaign losses remain raw and retain valid high-altitude data;
 - the journal-style `plots/` directory is unchanged;
 - `refinement/plotting.py` is unchanged;
-- the independent site/campaign diagnostic/cache refactor is retained;
-- the exact prior V2 implementation is preserved in `NN_construct_v2.py`;
-- the exact refactored driver is preserved in `NDref_prob_refactor.py`.
+- site and campaign diagnostics remain independent of training;
+- the exact prior V2 implementation is preserved in `NN_construct_v2.py`.
 
-## Main knobs
+## Main controls
 
 In `refinement/config.py`:
+
+- `TRAIN_WITH_CAMPAIGNS = True`: include campaign tensors in training. Set
+  `False` for a fixed-sites-only fit; `do_campaigns=True` can still run the
+  independent campaign diagnostic after training.
+- `TRAIN_INIT_MODE = "weights"`: start epoch 0 from
+  `TRAIN_INIT_WEIGHTS` and ignore an existing current-model checkpoint.
+- `TRAIN_INIT_MODE = "scratch"`: random initialization, ignoring checkpoints
+  and initialization weights.
+- `TRAIN_INIT_MODE = "resume"`: resume `MODEL_NAME.ckpt` when it exists;
+  otherwise start from the model's random initialization.
+- `TRAIN_INIT_WEIGHTS = "./NDnet_EOFcoeff_sigmaFT_weights.pt"`: V2 weights
+  used by `TRAIN_INIT_MODE = "weights"`.
+
+Relaxation controls:
 
 - `UPPER_RELAX_START_HPA = 600.0`
 - `UPPER_RELAX_TOP_HPA = 350.0`
 - `UPPER_RELAX_LAMBDA = 0.1`
 - `UPPER_RELAX_ND_SCALE = 100.0`
 
-The first run is initialized from `./NDnet_EOFcoeff_sigmaFT_weights.pt` unless
-an `NDnet_EOFcoeff_upperRelax.ckpt` checkpoint already exists. Change
-`hp["init_from_weights"]` if the preferred kinked V2 weights use another name.
+The training log reports the weighted relaxation contribution as `upper` at
+step level and `UpperRelax` as its epoch mean. `L_upper_relax` and
+`L_upper_relax_raw` are also written to the structured step logs.

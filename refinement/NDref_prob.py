@@ -1,74 +1,207 @@
-"""Launcher for the learned-upper-relax refinement experiment.
+"""Learned-upper-relax refinement driver.
 
-The substantial site/campaign diagnostic refactor is preserved byte-for-byte
-in ``NDref_prob_refactor.py``.  This thin launcher only seeds a fresh training
-checkpoint from the selected V2 weights, then executes that refactored driver.
+The heavy site/campaign diagnostic implementation lives in
+``refinement_driver.py``. This module keeps experiment controls explicit:
+training initialization and whether campaigns participate in training are
+independent from the site/campaign diagnostic switches.
 """
 
 from __future__ import annotations
 
 import os
-import runpy
 
 import torch
-import torch.optim as optim
+import torch.multiprocessing as mp
 
 import config as cfg
-from NN_construct import ProbRefineFromBaseAndX
-from train_infer import load_model_weights_for_inference, save_training_checkpoint
+import refinement_driver as core
 
 
-def _seed_checkpoint_from_v2_if_needed():
-    if not bool(getattr(cfg, "do_train", False)):
-        return
+_VALID_INIT_MODES = {"weights", "scratch", "resume"}
 
-    source = cfg.hp.get("init_from_weights", None)
-    if not source:
-        return
 
-    ckpt_path = cfg.hp["model_name"] + ".ckpt"
-    if os.path.exists(ckpt_path):
-        print(f"[RELAX-INIT] existing checkpoint found: {ckpt_path}")
-        return
-
-    if not os.path.exists(source):
-        raise FileNotFoundError(
-            f"[RELAX-INIT] requested V2 initialization weights not found: {source}"
+def _install_training_initialization():
+    """Apply the configured initialization policy without altering V2 code."""
+    mode = str(getattr(cfg, "TRAIN_INIT_MODE", "resume")).strip().lower()
+    if mode not in _VALID_INIT_MODES:
+        raise ValueError(
+            f"Unknown TRAIN_INIT_MODE={mode!r}; expected one of "
+            f"{sorted(_VALID_INIT_MODES)}"
         )
 
-    print("=" * 70)
-    print("[RELAX-INIT] seeding learned-relax run from V2 weights")
-    print(f"[RELAX-INIT] source = {source}")
-    print(f"[RELAX-INIT] target = {ckpt_path}")
-    print("=" * 70)
+    if mode == "resume":
+        print("[INIT] mode=resume: use current checkpoint when available")
+        return
 
-    # Four MODIS channels are defined by vars_in_2d.  Constructing this on CPU
-    # is sufficient because the universal checkpoint stores unprefixed model
-    # keys and an empty Adam state; the normal driver then resumes it on GPU.
-    model = ProbRefineFromBaseAndX(
-        in_channels=len(cfg.vars_in_2d),
-        num_modes=cfg.num_modes,
-        feat_ch=32,
-        head_ch=64,
-        sigma_min=float(cfg.hp.get("model_sigma_min", 1e-3)),
-        detach_sigma_features=bool(cfg.hp.get("detach_sigma_features", True)),
+    if bool(cfg.hp.get("fine_tune_sigma", False)):
+        raise ValueError(
+            "TRAIN_INIT_MODE='weights'/'scratch' is for full-model training; "
+            "disable fine_tune_sigma or use TRAIN_INIT_MODE='resume'."
+        )
+
+    if mode == "scratch":
+        def _start_fresh(model, optimizer, ckpt_path, device):
+            print(
+                f"[INIT] mode=scratch: ignoring checkpoint {ckpt_path}; "
+                "using random model initialization"
+            )
+            return 0
+
+        core.load_training_checkpoint = _start_fresh
+        return
+
+    source = str(getattr(cfg, "TRAIN_INIT_WEIGHTS", "")).strip()
+    if not source:
+        raise ValueError(
+            "TRAIN_INIT_MODE='weights' requires TRAIN_INIT_WEIGHTS."
+        )
+    if not os.path.exists(source):
+        raise FileNotFoundError(
+            f"[INIT] requested initialization weights not found: {source}"
+        )
+
+    def _start_from_weights(model, optimizer, ckpt_path, device):
+        print(
+            f"[INIT] mode=weights: ignoring checkpoint {ckpt_path}; "
+            f"loading {source}"
+        )
+        core.load_model_weights_for_inference(
+            model,
+            source,
+            device=device,
+            strict=True,
+            eval_mode=False,
+        )
+        return 0
+
+    core.load_training_checkpoint = _start_from_weights
+
+
+def _training_state(state):
+    """Return a shallow training view with campaigns optionally removed."""
+    use_campaigns = bool(getattr(cfg, "TRAIN_WITH_CAMPAIGNS", True))
+    if use_campaigns:
+        print("[TRAIN-DATA] fixed sites + campaigns")
+        return state
+
+    out = dict(state)
+    out["camp_bundle"] = None
+    out["campaign_ds"] = None
+    print("[TRAIN-DATA] fixed sites only; campaign tensors excluded from training")
+    return out
+
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    numgpu = torch.cuda.device_count()
+    mp.set_start_method("spawn", force=True)
+    numwork = 0
+
+    print("Using DataParallel on", numgpu, "GPUs")
+    print(
+        f"[RELAX] lambda={cfg.UPPER_RELAX_LAMBDA:g} "
+        f"start={cfg.UPPER_RELAX_START_HPA:g} hPa "
+        f"top={cfg.UPPER_RELAX_TOP_HPA:g} hPa "
+        f"scale={cfg.UPPER_RELAX_ND_SCALE:g} cm-3"
     )
-    load_model_weights_for_inference(
-        model,
-        source,
-        device=torch.device("cpu"),
-        strict=True,
-        eval_mode=False,
+    print("[RELAX] raw NN output is used at diagnostics and production inference")
+    print(
+        f"[TRAIN-DATA] TRAIN_WITH_CAMPAIGNS="
+        f"{bool(getattr(cfg, 'TRAIN_WITH_CAMPAIGNS', True))}"
     )
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=float(cfg.hp["l_r"]),
-        weight_decay=1e-5,
+    print(
+        f"[INIT] TRAIN_INIT_MODE="
+        f"{str(getattr(cfg, 'TRAIN_INIT_MODE', 'resume')).lower()}"
     )
-    save_training_checkpoint(model, optimizer, -1, ckpt_path)
-    print("[RELAX-INIT] checkpoint seeded at epoch 0")
+
+    if cfg.do_train:
+        run_model_name = core.active_model_name(cfg.hp)
+        print(
+            f"[MODE] training enabled; "
+            f"fine_tune_sigma={bool(cfg.hp.get('fine_tune_sigma', False))}"
+        )
+        print(f"[MODE] active training/output model = {run_model_name}")
+    else:
+        run_model_name = cfg.MODEL_NAME
+        print("[MODE] do_train=False -> frozen evaluation only")
+        print(f"[MODE] evaluation model = {run_model_name}")
+
+    site_cache_hit = False
+    campaign_cache_hit = False
+    if not cfg.do_train:
+        if cfg.do_sites:
+            site_cache_hit = core.diagnostic_cache_valid("site", run_model_name)
+        if cfg.do_campaigns:
+            campaign_cache_hit = core.diagnostic_cache_valid(
+                "campaign", run_model_name
+            )
+
+    if site_cache_hit:
+        core.render_site_diagnostics(
+            core.load_diagnostic_cache("site", run_model_name)
+        )
+    if campaign_cache_hit:
+        core.render_campaign_diagnostics(
+            core.load_diagnostic_cache("campaign", run_model_name)
+        )
+
+    need_sites_compute = bool(
+        cfg.do_sites and (cfg.do_train or not site_cache_hit)
+    )
+    need_campaigns_compute = bool(
+        cfg.do_campaigns and (cfg.do_train or not campaign_cache_hit)
+    )
+
+    state = None
+    model = None
+
+    if cfg.do_train or need_sites_compute or need_campaigns_compute:
+        need_campaign_bundle = bool(
+            need_campaigns_compute
+            or (
+                cfg.do_train
+                and bool(getattr(cfg, "TRAIN_WITH_CAMPAIGNS", True))
+            )
+        )
+        state = core.load_site_campaign_state(
+            need_campaign_bundle=need_campaign_bundle,
+            evaluation_only=not bool(cfg.do_train),
+            need_sites=need_sites_compute,
+            need_campaigns=need_campaigns_compute,
+        )
+
+    if cfg.do_train:
+        _install_training_initialization()
+        model, run_model_name = core.train_refinement_model(
+            _training_state(state),
+            device,
+            numgpu,
+            numwork,
+        )
+        need_sites_compute = bool(cfg.do_sites)
+        need_campaigns_compute = bool(cfg.do_campaigns)
+
+    elif need_sites_compute or need_campaigns_compute:
+        model = core.load_frozen_model(
+            state,
+            device,
+            numgpu,
+            run_model_name,
+        )
+
+    if need_sites_compute or need_campaigns_compute:
+        core.run_site_campaign_diagnostics(
+            state,
+            model,
+            device,
+            run_model_name,
+            need_sites=need_sites_compute,
+            need_campaigns=need_campaigns_compute,
+        )
+
+    core.run_global_test(device, numgpu, run_model_name)
+    print("DONE.")
 
 
 if __name__ == "__main__":
-    _seed_checkpoint_from_v2_if_needed()
-    runpy.run_module("NDref_prob_refactor", run_name="__main__")
+    main()
