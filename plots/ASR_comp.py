@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Compare fixed-site ASR daily droplet-number observations against NDnet 2-D
-predictions stored as monthly NetCDF files, and make per-site box plots.
+predictions stored as monthly NetCDF files, and make journal-style box plots.
 
 Current NDnet monthly files are expected to look like, for example:
     NDnet_modis_compare_800_950hPa_201502.nc
@@ -16,7 +16,7 @@ Workflow
 4. Open each needed NDnet monthly file once.
 5. Extract nearest-grid-point NDnet values for all sites.
 6. Align by site/date.
-7. Write simplified statistics and make one box-plot panel per site.
+7. Write simplified statistics and make journal-style distribution figures.
 
 Statistics reported
 -------------------
@@ -34,8 +34,8 @@ Outputs
 * site_to_ndnet_grid_mapping.csv
 * missing_ndnet_months.csv                 (if needed)
 * missing_ndnet_dates_inside_months.csv    (if needed)
-* boxplot_ASR_vs_NDnet_allvars.png
-* boxplot_ASR_vs_NDnet_allvars.pdf
+* boxplot_ASR_vs_NDnet_allvars.png/.pdf
+* boxplot_ASR_raw_filtered_by_site.png/.pdf
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ import xarray as xr
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 
 
 DEFAULT_OBS_DIR = Path(
@@ -77,6 +78,24 @@ PREFERRED_ND_VARS = [
     "nd_unweighted_modis_track_ctt_cf",
 ]
 
+# Required for the compact single-panel site/campaign comparison.
+SUMMARY_BOX_VARS = (
+    "nd_unweighted_no_mask",
+    "nd_modis_track_ctt_cf",
+)
+
+# Journal figure settings.
+FIG_WIDTH = 7.2
+PANEL_HEIGHT = 2.15
+SINGLE_PANEL_HEIGHT = 3.35
+PLOT_DPI = 400
+
+OBS_COLOR = "#666666"
+RAW_COLOR = "#D55E00"
+FILTERED_COLOR = "#0072B2"
+WEIGHTED_COLOR = "#4C72B0"
+UNWEIGHTED_COLOR = "#DD8452"
+
 
 # -----------------------------------------------------------------------------
 # Basic utilities
@@ -88,7 +107,6 @@ def parse_date_arg(x: Optional[str]) -> Optional[pd.Timestamp]:
     return pd.Timestamp(x).normalize()
 
 
-
 def normalize_dates(values) -> pd.DatetimeIndex:
     """Convert decoded xarray time values to midnight-normalized pandas dates."""
     try:
@@ -98,13 +116,11 @@ def normalize_dates(values) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(out).normalize()
 
 
-
 def attr_str(ds: xr.Dataset, key: str, default: str = "") -> str:
     val = ds.attrs.get(key, default)
     if isinstance(val, bytes):
         return val.decode(errors="replace")
     return str(val)
-
 
 
 def site_names_from_attrs(ds: xr.Dataset, path: Path) -> Tuple[str, str, str, str, str]:
@@ -121,7 +137,6 @@ def site_names_from_attrs(ds: xr.Dataset, path: Path) -> Tuple[str, str, str, st
         label = site
 
     return site, label, site_id, facility_id, datastream
-
 
 
 def convert_lon_to_grid(site_lon: float, grid_lons: np.ndarray) -> float:
@@ -141,7 +156,6 @@ def convert_lon_to_grid(site_lon: float, grid_lons: np.ndarray) -> float:
     return lon
 
 
-
 def lon_for_distance(grid_lon: float, site_lon: float) -> float:
     glon = float(grid_lon)
     slon = float(site_lon)
@@ -150,7 +164,6 @@ def lon_for_distance(grid_lon: float, site_lon: float) -> float:
     if slon > 180.0 and glon < 0.0:
         return glon + 360.0
     return glon
-
 
 
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
@@ -168,11 +181,9 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     return 2.0 * r * math.asin(math.sqrt(a))
 
 
-
 def nearest_index_1d(coord: np.ndarray, target: float) -> int:
     coord = np.asarray(coord, dtype=float)
     return int(np.nanargmin(np.abs(coord - float(target))))
-
 
 
 def split_csv_arg(x: Optional[str]) -> Optional[List[str]]:
@@ -180,7 +191,6 @@ def split_csv_arg(x: Optional[str]) -> Optional[List[str]]:
         return None
     out = [v.strip() for v in str(x).split(",") if v.strip()]
     return out or None
-
 
 
 def format_ndnet_month_path(ndnet_dir: Path, template: str, yyyymm: str) -> Path:
@@ -283,7 +293,9 @@ def read_obs_sites(
                     "obs_start": range_df["date"].min(),
                     "obs_end": range_df["date"].max(),
                     "n_obs_days_in_file": int(len(df)),
-                    "n_finite_obs_days": int(np.isfinite(df["obs_cm3"].to_numpy(float)).sum()),
+                    "n_finite_obs_days": int(
+                        np.isfinite(df["obs_cm3"].to_numpy(float)).sum()
+                    ),
                 }
             )
 
@@ -292,7 +304,9 @@ def read_obs_sites(
 
     obs_df = pd.concat(obs_frames, ignore_index=True)
     obs_df = (
-        obs_df.groupby(["site", "label", "date", "obs_file"], as_index=False)["obs_cm3"]
+        obs_df.groupby(["site", "label", "date", "obs_file"], as_index=False)[
+            "obs_cm3"
+        ]
         .mean()
         .sort_values(["site", "date"])
         .reset_index(drop=True)
@@ -338,7 +352,6 @@ def build_needed_ndnet_months(
         if p.exists():
             file_by_month[key] = p
         else:
-            # fallback: try nc4 if template used .nc, or nc if template used .nc4
             alt = None
             if str(p).endswith(".nc"):
                 alt = Path(str(p) + "4")
@@ -349,17 +362,28 @@ def build_needed_ndnet_months(
             else:
                 missing_months.append(key)
 
-    print(f"[NDnet] Need {len(dates)} obs dates in {len(dates_by_month)} months", flush=True)
-    print(f"[NDnet] Found {len(file_by_month)} expected monthly NDnet files", flush=True)
+    print(
+        f"[NDnet] Need {len(dates)} obs dates in {len(dates_by_month)} months",
+        flush=True,
+    )
+    print(
+        f"[NDnet] Found {len(file_by_month)} expected monthly NDnet files",
+        flush=True,
+    )
     if missing_months:
-        print(f"[NDnet] Missing {len(missing_months)} monthly NDnet files; first missing months:", flush=True)
+        print(
+            f"[NDnet] Missing {len(missing_months)} monthly NDnet files; "
+            "first missing months:",
+            flush=True,
+        )
         print("        " + ", ".join(missing_months[:12]), flush=True)
 
     if not file_by_month:
         example_key = sorted(dates_by_month)[0]
         example = format_ndnet_month_path(ndnet_dir, ndnet_month_template, example_key)
         raise FileNotFoundError(
-            f"None of the expected monthly NDnet files exist. Example expected path: {example}"
+            "None of the expected monthly NDnet files exist. "
+            f"Example expected path: {example}"
         )
 
     return dates_by_month, file_by_month, missing_months
@@ -374,16 +398,38 @@ def infer_nd_vars(sample_file: Path, requested: Optional[Sequence[str]]) -> List
         if requested:
             missing = [v for v in requested if v not in ds]
             if missing:
-                raise KeyError(f"Requested NDnet variables missing from {sample_file.name}: {missing}")
+                raise KeyError(
+                    f"Requested NDnet variables missing from {sample_file.name}: {missing}"
+                )
             return list(requested)
 
         preferred = [v for v in PREFERRED_ND_VARS if v in ds.data_vars]
-        other = sorted([v for v in ds.data_vars if v.startswith("nd_") and v not in preferred])
+        other = sorted(
+            [v for v in ds.data_vars if v.startswith("nd_") and v not in preferred]
+        )
         nd_vars = preferred + other
         if not nd_vars:
             raise KeyError(f"No NDnet variables starting with 'nd_' found in {sample_file}")
         return nd_vars
 
+
+def ensure_summary_vars(
+    sample_file: Path,
+    nd_vars: Sequence[str],
+) -> List[str]:
+    """Ensure the raw/filtered variables needed by the grouped plot are extracted."""
+    with xr.open_dataset(sample_file, decode_times=False) as ds:
+        missing = [v for v in SUMMARY_BOX_VARS if v not in ds]
+    if missing:
+        raise KeyError(
+            f"Required grouped-box variables missing from {sample_file.name}: {missing}"
+        )
+
+    out = list(nd_vars)
+    for var in SUMMARY_BOX_VARS:
+        if var not in out:
+            out.append(var)
+    return out
 
 
 def compute_site_grid_mapping(
@@ -435,7 +481,6 @@ def compute_site_grid_mapping(
     return pd.DataFrame(rows).sort_values("label").reset_index(drop=True)
 
 
-
 def extract_ndnet_monthly_for_sites(
     dates_by_month: Dict[str, List[pd.Timestamp]],
     file_by_month: Dict[str, Path],
@@ -460,7 +505,9 @@ def extract_ndnet_monthly_for_sites(
 
     for i, yyyymm in enumerate(months, start=1):
         path = file_by_month[yyyymm]
-        want_dates = sorted(pd.Timestamp(d).normalize() for d in dates_by_month[yyyymm])
+        want_dates = sorted(
+            pd.Timestamp(d).normalize() for d in dates_by_month[yyyymm]
+        )
 
         if i == 1 or i % progress_every == 0 or i == len(months):
             print(
@@ -483,31 +530,48 @@ def extract_ndnet_monthly_for_sites(
 
             for d in missing_dates:
                 missing_time_rows.append(
-                    {"month": yyyymm, "missing_date_inside_month_file": d, "file": path.name}
+                    {
+                        "month": yyyymm,
+                        "missing_date_inside_month_file": d,
+                        "file": path.name,
+                    }
                 )
 
             if not have_dates:
-                warnings.warn(f"{path.name}: none of the requested obs dates are present in time coordinate")
+                warnings.warn(
+                    f"{path.name}: none of the requested obs dates are present "
+                    "in time coordinate"
+                )
                 continue
 
             time_idx_da = xr.DataArray(
-                [pos_by_date[d] for d in have_dates], dims="date", coords={"date": have_dates}
+                [pos_by_date[d] for d in have_dates],
+                dims="date",
+                coords={"date": have_dates},
             )
 
             vals_by_var: Dict[str, np.ndarray] = {}
             for var in nd_vars:
                 if var not in ds:
-                    vals_by_var[var] = np.full((len(have_dates), len(site_order)), np.nan, dtype=float)
+                    vals_by_var[var] = np.full(
+                        (len(have_dates), len(site_order)), np.nan, dtype=float
+                    )
                     continue
 
                 da = ds[var]
                 if "lat" not in da.dims or "lon" not in da.dims:
-                    warnings.warn(f"{path.name}:{var} does not have lat/lon dims; filling NaN")
-                    vals_by_var[var] = np.full((len(have_dates), len(site_order)), np.nan, dtype=float)
+                    warnings.warn(
+                        f"{path.name}:{var} does not have lat/lon dims; filling NaN"
+                    )
+                    vals_by_var[var] = np.full(
+                        (len(have_dates), len(site_order)), np.nan, dtype=float
+                    )
                     continue
 
                 if "time" in da.dims:
-                    point = da.isel(time=time_idx_da, lat=lat_idx_da, lon=lon_idx_da)
+                    point = da.isel(
+                        time=time_idx_da, lat=lat_idx_da, lon=lon_idx_da
+                    )
                     if "date" in point.dims and "site" in point.dims:
                         point = point.transpose("date", "site")
                     arr = np.asarray(point.values, dtype=float)
@@ -530,7 +594,11 @@ def extract_ndnet_monthly_for_sites(
                     row[var] = float(vals_by_var[var][t, k])
                 records.append(row)
 
-    pred_df = pd.DataFrame(records).sort_values(["site", "date"]).reset_index(drop=True)
+    pred_df = (
+        pd.DataFrame(records)
+        .sort_values(["site", "date"])
+        .reset_index(drop=True)
+    )
     missing_time_df = pd.DataFrame(missing_time_rows)
     return pred_df, missing_time_df
 
@@ -539,7 +607,11 @@ def extract_ndnet_monthly_for_sites(
 # Statistics
 # -----------------------------------------------------------------------------
 
-def compute_pair_stats(df: pd.DataFrame, var: str, min_corr_n: int) -> Dict[str, float]:
+def compute_pair_stats(
+    df: pd.DataFrame,
+    var: str,
+    min_corr_n: int,
+) -> Dict[str, float]:
     sub = df[["obs_cm3", var]].replace([np.inf, -np.inf], np.nan).dropna()
     n = int(len(sub))
     if n == 0:
@@ -556,7 +628,9 @@ def compute_pair_stats(df: pd.DataFrame, var: str, min_corr_n: int) -> Dict[str,
 
     good_pct = np.isfinite(obs) & np.isfinite(mod) & (obs != 0.0)
     if np.any(good_pct):
-        mean_pct_bias = float(np.nanmean(100.0 * (mod[good_pct] - obs[good_pct]) / obs[good_pct]))
+        mean_pct_bias = float(
+            np.nanmean(100.0 * (mod[good_pct] - obs[good_pct]) / obs[good_pct])
+        )
     else:
         mean_pct_bias = np.nan
 
@@ -570,7 +644,6 @@ def compute_pair_stats(df: pd.DataFrame, var: str, min_corr_n: int) -> Dict[str,
         "mean_pct_bias": mean_pct_bias,
         "temporal_corr": corr,
     }
-
 
 
 def make_stats_tables(
@@ -594,40 +667,92 @@ def make_stats_tables(
                 }
             )
 
-    by_site = pd.DataFrame(rows).sort_values(["label", "ndnet_variable"]).reset_index(drop=True)
+    by_site = (
+        pd.DataFrame(rows)
+        .sort_values(["label", "ndnet_variable"])
+        .reset_index(drop=True)
+    )
 
     agg_rows = []
     for var in nd_vars:
-        agg_rows.append({"group": "all_sites", "ndnet_variable": var, **compute_pair_stats(merged, var, min_corr_n)})
+        agg_rows.append(
+            {
+                "group": "all_sites",
+                "ndnet_variable": var,
+                **compute_pair_stats(merged, var, min_corr_n),
+            }
+        )
     aggregate = pd.DataFrame(agg_rows)
 
     return by_site, aggregate
 
 
 # -----------------------------------------------------------------------------
-# Plotting
+# Journal plotting
 # -----------------------------------------------------------------------------
 
 def configure_matplotlib():
     mpl.rcParams.update(
         {
             "figure.dpi": 150,
-            "savefig.dpi": 450,
+            "savefig.dpi": PLOT_DPI,
             "savefig.bbox": "tight",
-            "font.size": 9.0,
-            "axes.labelsize": 9.0,
-            "axes.titlesize": 9.5,
-            "xtick.labelsize": 8.0,
-            "ytick.labelsize": 8.0,
-            "legend.fontsize": 8.0,
-            "axes.linewidth": 0.8,
-            "xtick.major.width": 0.8,
-            "ytick.major.width": 0.8,
+            "savefig.pad_inches": 0.03,
+            "font.size": 8.0,
+            "axes.labelsize": 8.5,
+            "axes.titlesize": 7.5,
+            "xtick.labelsize": 7.0,
+            "ytick.labelsize": 7.0,
+            "legend.fontsize": 7.5,
+            "axes.linewidth": 0.7,
+            "xtick.major.width": 0.7,
+            "ytick.major.width": 0.7,
+            "xtick.minor.width": 0.5,
+            "ytick.minor.width": 0.5,
+            "xtick.major.size": 3.0,
+            "ytick.major.size": 3.0,
+            "xtick.direction": "out",
+            "ytick.direction": "out",
+            "legend.frameon": False,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     )
 
+
+def panel_letter(index: int) -> str:
+    """Convert 0,1,... into a,b,...,z,aa,ab,..."""
+    result = ""
+    i = int(index)
+    while True:
+        result = chr(ord("a") + (i % 26)) + result
+        i = i // 26 - 1
+        if i < 0:
+            break
+    return result
+
+
+def style_axis(ax):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, axis="y", color="0.88", linewidth=0.45, zorder=0)
+    ax.tick_params(top=False, right=False)
+
+
+def save_figure_formats(
+    fig,
+    out_base: Path,
+    formats: Sequence[str] = ("png", "pdf"),
+):
+    out_base = Path(out_base)
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    for fmt in formats:
+        out = out_base.with_suffix(f".{fmt}")
+        kwargs = {"bbox_inches": "tight", "pad_inches": 0.03}
+        if fmt.lower() == "png":
+            kwargs["dpi"] = PLOT_DPI
+        fig.savefig(out, **kwargs)
+        print(f"[WRITE] {out}", flush=True)
 
 
 def var_label(var: str) -> str:
@@ -645,14 +770,19 @@ def var_label(var: str) -> str:
     return mapping.get(var, var)
 
 
-
 def box_color(var: str) -> str:
     if var == "obs_cm3":
-        return "#666666"
+        return OBS_COLOR
     if var.startswith("nd_unweighted"):
-        return "#dd8452"
-    return "#4c72b0"
+        return UNWEIGHTED_COLOR
+    return WEIGHTED_COLOR
 
+
+def finite_values(df: pd.DataFrame, var: str) -> np.ndarray:
+    if var not in df.columns:
+        return np.empty(0, dtype=float)
+    vals = df[var].replace([np.inf, -np.inf], np.nan).dropna().to_numpy(float)
+    return vals[np.isfinite(vals)]
 
 
 def make_boxplot_panels(
@@ -664,6 +794,7 @@ def make_boxplot_panels(
     ylim: Optional[Tuple[float, float]],
     formats: Sequence[str],
 ):
+    """Journal-style version of the original per-site all-variable box plot."""
     configure_matplotlib()
 
     site_order = site_df.sort_values("label")["site"].tolist()
@@ -673,71 +804,180 @@ def make_boxplot_panels(
     ncols = max(1, int(ncols))
     nrows = int(math.ceil(nsite / ncols))
 
-    fig_w = max(8.0, 5.0 * ncols)
-    fig_h = max(2.8 * nrows, 2.8)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), squeeze=False)
+    fig_h = PANEL_HEIGHT * nrows + 0.20
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(FIG_WIDTH, fig_h),
+        squeeze=False,
+        sharey=True,
+    )
     axes_flat = axes.ravel()
 
-    for ax, site in zip(axes_flat, site_order):
+    for i, (ax, site) in enumerate(zip(axes_flat, site_order)):
         g = merged[merged["site"] == site].sort_values("date")
 
         plot_data = []
         labels = []
         colors = []
         for var in box_vars:
-            if var not in g.columns:
-                continue
-            vals = g[var].replace([np.inf, -np.inf], np.nan).dropna().to_numpy(float)
+            vals = finite_values(g, var)
             if vals.size == 0:
                 continue
             plot_data.append(vals)
             labels.append(var_label(var))
             colors.append(box_color(var))
 
+        style_axis(ax)
+        ax.set_title(
+            f"({panel_letter(i)}) {label_lookup.get(site, site)}",
+            loc="left",
+            fontsize=7.5,
+            pad=2.5,
+        )
+
         if not plot_data:
-            ax.set_visible(False)
+            ax.text(
+                0.5,
+                0.5,
+                "No valid data",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                fontsize=7.0,
+            )
             continue
 
         bp = ax.boxplot(
             plot_data,
             patch_artist=True,
-            widths=0.65,
+            widths=0.60,
             showfliers=False,
-            medianprops={"color": "black", "linewidth": 1.0},
-            whiskerprops={"linewidth": 0.9},
-            capprops={"linewidth": 0.9},
-            boxprops={"linewidth": 0.9},
+            medianprops={"color": "black", "linewidth": 0.9},
+            whiskerprops={"color": "0.25", "linewidth": 0.7},
+            capprops={"color": "0.25", "linewidth": 0.7},
+            boxprops={"color": "0.25", "linewidth": 0.7},
         )
 
         for patch, color in zip(bp["boxes"], colors):
             patch.set_facecolor(color)
-            patch.set_alpha(0.85)
-            patch.set_edgecolor("black")
+            patch.set_alpha(0.82)
+            patch.set_edgecolor("0.25")
 
-        ax.set_title(label_lookup.get(site, site), loc="left")
         ax.set_xticks(np.arange(1, len(labels) + 1))
-        ax.set_xticklabels(labels, rotation=40, ha="right")
-        ax.set_ylabel(r"$N_d$ (cm$^{-3}$)")
-        ax.grid(True, axis="y", color="0.88", linewidth=0.6)
-        ax.tick_params(direction="out", length=3.0)
+        ax.set_xticklabels(labels, rotation=35, ha="right", rotation_mode="anchor")
         if ylim is not None:
             ax.set_ylim(*ylim)
+
+        col = i % ncols
+        if col != 0:
+            ax.tick_params(axis="y", labelleft=False)
 
     for ax in axes_flat[nsite:]:
         ax.set_visible(False)
 
-    fig.suptitle(
-        "ASR daily droplet number and NDnet site-extracted distributions",
-        y=1.01,
-        fontsize=11.5,
+    fig.supylabel(r"$N_d$ (cm$^{-3}$)", fontsize=8.5, x=0.018)
+    fig.subplots_adjust(
+        left=0.075,
+        right=0.985,
+        bottom=0.115,
+        top=0.965,
+        wspace=0.12,
+        hspace=0.30,
     )
-    fig.tight_layout()
 
-    out_base.parent.mkdir(parents=True, exist_ok=True)
-    for fmt in formats:
-        out = out_base.with_suffix(f".{fmt}")
-        fig.savefig(out)
-        print(f"[WRITE] {out}", flush=True)
+    save_figure_formats(fig, out_base, formats=formats)
+    plt.close(fig)
+
+
+def make_grouped_site_boxplot(
+    merged: pd.DataFrame,
+    site_df: pd.DataFrame,
+    out_base: Path,
+    ylim: Optional[Tuple[float, float]],
+    formats: Sequence[str] = ("png", "pdf"),
+):
+    """Single-panel site/campaign box plot: Obs, raw, and filtered NDnet."""
+    configure_matplotlib()
+
+    series = [
+        ("obs_cm3", "Obs", OBS_COLOR),
+        ("nd_unweighted_no_mask", "raw", RAW_COLOR),
+        ("nd_modis_track_ctt_cf", "filtered", FILTERED_COLOR),
+    ]
+
+    missing = [var for var, _, _ in series if var not in merged.columns]
+    if missing:
+        raise KeyError(f"Grouped box plot is missing required columns: {missing}")
+
+    ordered = site_df.sort_values("label").reset_index(drop=True)
+    site_order = ordered["site"].tolist()
+    labels = ordered["label"].tolist()
+    centers = np.arange(len(site_order), dtype=float)
+
+    box_width = 0.20
+    offsets = (-0.24, 0.0, 0.24)
+
+    fig, ax = plt.subplots(figsize=(FIG_WIDTH, SINGLE_PANEL_HEIGHT))
+    style_axis(ax)
+
+    for offset, (var, label, color) in zip(offsets, series):
+        data = []
+        for site in site_order:
+            g = merged[merged["site"] == site]
+            vals = finite_values(g, var)
+            if vals.size == 0:
+                vals = np.asarray([np.nan], dtype=float)
+            data.append(vals)
+
+        bp = ax.boxplot(
+            data,
+            positions=centers + offset,
+            widths=box_width,
+            patch_artist=True,
+            showfliers=False,
+            manage_ticks=False,
+            medianprops={"color": "black", "linewidth": 0.9},
+            whiskerprops={"color": "0.25", "linewidth": 0.7},
+            capprops={"color": "0.25", "linewidth": 0.7},
+            boxprops={"color": "0.25", "linewidth": 0.7},
+        )
+        for patch in bp["boxes"]:
+            patch.set_facecolor(color)
+            patch.set_alpha(0.84)
+            patch.set_edgecolor("0.25")
+
+    ax.set_xticks(centers)
+    ax.set_xticklabels(labels, rotation=35, ha="right", rotation_mode="anchor")
+    ax.set_xlim(-0.55, max(0.55, len(site_order) - 0.45))
+    ax.set_xlabel("Site / campaign")
+    ax.set_ylabel(r"$N_d$ (cm$^{-3}$)")
+
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    handles = [
+        Patch(facecolor=color, edgecolor="0.25", linewidth=0.7, label=label)
+        for _, label, color in series
+    ]
+    ax.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=3,
+        frameon=False,
+        handlelength=1.4,
+        columnspacing=1.5,
+    )
+
+    fig.subplots_adjust(
+        left=0.09,
+        right=0.985,
+        bottom=0.23,
+        top=0.89,
+    )
+
+    save_figure_formats(fig, out_base, formats=formats)
     plt.close(fig)
 
 
@@ -747,7 +987,10 @@ def make_boxplot_panels(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Compare fixed-site ASR daily Nd against monthly NDnet 2-D files and make site box plots."
+        description=(
+            "Compare fixed-site ASR daily Nd against monthly NDnet 2-D files "
+            "and make journal-style site box plots."
+        )
     )
     p.add_argument("--obs-dir", type=Path, default=DEFAULT_OBS_DIR)
     p.add_argument("--ndnet-dir", type=Path, default=DEFAULT_NDNET_DIR)
@@ -765,7 +1008,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--nd-vars",
         default=None,
-        help="Comma-separated NDnet variables to include. Default: all nd_* vars, preferred first.",
+        help=(
+            "Comma-separated NDnet variables for statistics/all-variable panels. "
+            "The raw/filtered variables needed by the grouped plot are extracted "
+            "automatically. Default: all nd_* vars, preferred first."
+        ),
     )
     p.add_argument("--date-start", default=None, help="Optional YYYY-MM-DD lower bound")
     p.add_argument("--date-end", default=None, help="Optional YYYY-MM-DD upper bound")
@@ -785,7 +1032,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-
 def parse_ylim(s: Optional[str]) -> Optional[Tuple[float, float]]:
     if s is None or str(s).strip() == "":
         return None
@@ -793,7 +1039,6 @@ def parse_ylim(s: Optional[str]) -> Optional[Tuple[float, float]]:
     if len(parts) != 2:
         raise ValueError("--ylim must be like 0,300")
     return parts[0], parts[1]
-
 
 
 def main():
@@ -833,7 +1078,11 @@ def main():
 
     sample_file = next(iter(file_by_month.values()))
     nd_vars = infer_nd_vars(sample_file, nd_vars_requested)
-    print(f"[NDnet] variables: {', '.join(nd_vars)}")
+    extract_vars = ensure_summary_vars(sample_file, nd_vars)
+    print(f"[NDnet] statistics variables: {', '.join(nd_vars)}")
+    if extract_vars != list(nd_vars):
+        added = [v for v in extract_vars if v not in nd_vars]
+        print(f"[NDnet] added for grouped box plot: {', '.join(added)}")
 
     grid_df = compute_site_grid_mapping(site_df, sample_file, args.max_distance_km)
     grid_df.to_csv(args.outdir / "site_to_ndnet_grid_mapping.csv", index=False)
@@ -844,7 +1093,7 @@ def main():
         file_by_month=file_by_month,
         site_df=site_df,
         grid_df=grid_df,
-        nd_vars=nd_vars,
+        nd_vars=extract_vars,
         progress_every=args.progress_every,
     )
 
@@ -853,9 +1102,15 @@ def main():
     merged.to_csv(args.outdir / "matched_daily_asr_ndnet.csv", index=False)
     print(f"[WRITE] {args.outdir / 'matched_daily_asr_ndnet.csv'}")
 
-    stats_site, stats_all = make_stats_tables(merged, site_df, nd_vars, args.min_corr_n)
-    stats_site.to_csv(args.outdir / "stats_by_site_and_ndnet_variable.csv", index=False)
-    stats_all.to_csv(args.outdir / "stats_all_sites_by_ndnet_variable.csv", index=False)
+    stats_site, stats_all = make_stats_tables(
+        merged, site_df, nd_vars, args.min_corr_n
+    )
+    stats_site.to_csv(
+        args.outdir / "stats_by_site_and_ndnet_variable.csv", index=False
+    )
+    stats_all.to_csv(
+        args.outdir / "stats_all_sites_by_ndnet_variable.csv", index=False
+    )
     print(f"[WRITE] {args.outdir / 'stats_by_site_and_ndnet_variable.csv'}")
     print(f"[WRITE] {args.outdir / 'stats_all_sites_by_ndnet_variable.csv'}")
 
@@ -864,7 +1119,11 @@ def main():
             {
                 "missing_month": missing_months,
                 "expected_file": [
-                    str(format_ndnet_month_path(args.ndnet_dir, args.ndnet_month_template, m))
+                    str(
+                        format_ndnet_month_path(
+                            args.ndnet_dir, args.ndnet_month_template, m
+                        )
+                    )
                     for m in missing_months
                 ],
             }
@@ -873,7 +1132,9 @@ def main():
         print(f"[WRITE] {args.outdir / 'missing_ndnet_months.csv'}")
 
     if not missing_time_df.empty:
-        missing_time_df.to_csv(args.outdir / "missing_ndnet_dates_inside_months.csv", index=False)
+        missing_time_df.to_csv(
+            args.outdir / "missing_ndnet_dates_inside_months.csv", index=False
+        )
         print(f"[WRITE] {args.outdir / 'missing_ndnet_dates_inside_months.csv'}")
 
     box_vars = ["obs_cm3"] + [v for v in nd_vars if v in merged.columns]
@@ -883,6 +1144,14 @@ def main():
         box_vars=box_vars,
         out_base=args.outdir / "boxplot_ASR_vs_NDnet_allvars",
         ncols=args.ncols,
+        ylim=ylim,
+        formats=("png", "pdf"),
+    )
+
+    make_grouped_site_boxplot(
+        merged=merged,
+        site_df=site_df,
+        out_base=args.outdir / "boxplot_ASR_raw_filtered_by_site",
         ylim=ylim,
         formats=("png", "pdf"),
     )
