@@ -18,8 +18,8 @@ import config as cfg
 from NN_construct_v2 import SparseSiteCampaignNLLRefineLoss as _V2Loss
 
 
-def _smootherstep_taper(pressure_hpa, p_start, p_top):
-    """Return T(p): 1 below p_start, 0 above p_top, smooth in between."""
+def _linear_logp_relax_weight(pressure_hpa, p_start, p_top):
+    """Return W(p): 0 below p_start, 1 above p_top, linear in log-pressure."""
     p = np.asarray(pressure_hpa, dtype=np.float64)
     p_start = float(p_start)
     p_top = float(p_top)
@@ -28,8 +28,17 @@ def _smootherstep_taper(pressure_hpa, p_start, p_top):
             f"UPPER_RELAX_START_HPA must exceed UPPER_RELAX_TOP_HPA; "
             f"got {p_start:g} and {p_top:g}."
         )
-    x = np.clip((p - p_top) / (p_start - p_top), 0.0, 1.0)
-    return 6.0 * x**5 - 15.0 * x**4 + 10.0 * x**3
+    if np.any(~np.isfinite(p)) or np.any(p <= 0.0):
+        raise ValueError(
+            "Pressure levels must be finite and positive for log-pressure relaxation."
+        )
+
+    # W=0 at and below the start pressure, W=1 at and above the top pressure.
+    # Between them, the preference for the base increases linearly with log(p),
+    # which spreads the relaxation force more evenly over atmospheric height.
+    denom = np.log(p_start) - np.log(p_top)
+    w = (np.log(p_start) - np.log(p)) / denom
+    return np.clip(w, 0.0, 1.0)
 
 
 class SparseSiteCampaignNLLRefineLossRelax(_V2Loss):
@@ -40,11 +49,11 @@ class SparseSiteCampaignNLLRefineLossRelax(_V2Loss):
 
         dNd(p) = sum_m c_m EOF_m(p).
 
-    We penalize this departure with W(p) = 1 - T(p), where T is the quintic
-    smootherstep used by the former post-processing taper.  Thus W=0 below
-    ``UPPER_RELAX_START_HPA`` and rises smoothly to W=1 by
-    ``UPPER_RELAX_TOP_HPA``.  Crucially, the prediction itself is never
-    multiplied by T.  The network must learn the relaxation in its raw output.
+    We penalize this departure with a weight W(p) that is zero below
+    ``UPPER_RELAX_START_HPA``, rises linearly in log-pressure through the
+    transition, and reaches one by ``UPPER_RELAX_TOP_HPA``.  Crucially, the
+    prediction itself is never multiplied by W.  The network must learn the
+    relaxation in its raw output.
 
     The vertical quadratic is precomputed in mode space:
 
@@ -87,12 +96,11 @@ class SparseSiteCampaignNLLRefineLossRelax(_V2Loss):
                 f"Expected EOF shape (mode,lev), got {eof.shape} for {lev.size} levels."
             )
 
-        taper = _smootherstep_taper(
+        relax_w = _linear_logp_relax_weight(
             lev,
             self.upper_relax_start_hpa,
             self.upper_relax_top_hpa,
         )
-        relax_w = 1.0 - taper
         valid = np.isfinite(lev) & np.isfinite(relax_w) & (lev > 0.0)
         relax_w = np.where(valid, relax_w, 0.0)
         wsum = float(relax_w.sum())

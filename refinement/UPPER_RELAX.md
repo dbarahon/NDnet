@@ -8,10 +8,12 @@ The added term operates on the **raw refinement departure from the V2 base**:
 
 `dNd(p) = sum_m [dA_m - mu0_m] EOF_m(p)`.
 
-A quintic smootherstep defines a relaxation weight that is zero at and below
-600 hPa and rises smoothly to one by 350 hPa. The model is penalized for raw
-Nd departures from the base according to this weight. Predictions themselves
-are never tapered.
+The relaxation weight is zero at and below 600 hPa, rises **linearly in
+log-pressure** between 600 and 350 hPa, and is one at and above 350 hPa. This
+spreads the attraction toward the base more evenly over atmospheric height
+than the previous quintic smootherstep. The model is penalized for raw Nd
+departures from the base according to this weight. Predictions themselves are
+never tapered.
 
 Consequences:
 
