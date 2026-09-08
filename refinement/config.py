@@ -1,5 +1,4 @@
 import numpy as np
-import torch
 import xarray as xr
 
 # ============================================================
@@ -7,7 +6,7 @@ import xarray as xr
 # ============================================================
 
 MODEL_BASE = "NDnet_EOFcoeff"
-MODEL_NAME = "NDnet_EOFcoeff_upperRelax"
+MODEL_NAME = "NDnet_EOFcoeff_dimless"
 BASEROOT = "/panfs/ccds02/nobackup/people/dbarahon/NDnet/EOF/in_cloudM2/best/"
 
 # Independent actions.
@@ -16,14 +15,14 @@ do_sites = True
 do_campaigns = True
 do_test = True
 
-# Training data selection.  This does not affect campaign diagnostics:
+# Training data selection. This does not affect campaign diagnostics:
 # TRAIN_WITH_CAMPAIGNS=False trains on fixed sites only, while
 # do_campaigns=True can still evaluate the resulting model on campaigns.
 TRAIN_WITH_CAMPAIGNS = True
 
 # Training initialization:
 #   "weights" -> start epoch 0 from TRAIN_INIT_WEIGHTS
-#   "scratch" -> random model initialization, ignore checkpoints/weights
+#   "scratch" -> random model initialization
 #   "resume"  -> resume MODEL_NAME.ckpt when present; otherwise random init
 TRAIN_INIT_MODE = "weights"
 TRAIN_INIT_WEIGHTS = "./NDnet_EOFcoeff_sigmaFT_weights.pt"
@@ -61,23 +60,39 @@ SITE_DIAGNOSTIC_OBS_DAYS_ONLY = True
 
 MIN_ND = 1.0
 
-# The refactored diagnostic driver still understands the historical taper
-# interface.  Keep it explicitly disabled: learned-upper-relax predictions,
-# including site/campaign diagnostics, are always evaluated raw.
+# Historical post-inference taper interface. Keep disabled: the learned
+# relaxation acts only in the training objective and raw network output is
+# used for diagnostics and production inference.
 UPPER_TAPER_MODE = "none"
-UPPER_TAPER_START_HPA = 600.0
-UPPER_TAPER_TOP_HPA = 350.0
+UPPER_TAPER_START_HPA = 700.0
+UPPER_TAPER_TOP_HPA = 500.0
 SAVE_RAW_TAPER_FIELDS = False
+
+# ============================================================
+# Fixed dimensionless loss scales
+# ============================================================
+
+# All Nd-space squared-error/prior terms are expressed relative to this fixed
+# physical scale. A 100 cm-3 RMS error therefore contributes order unity.
+LOSS_ND_SCALE = 100.0  # cm-3
+
+# Coefficient-space likelihood and sigma terms are normalized by the
+# latitude-area-weighted RMS of each base residual coefficient over training
+# days. The floor prevents a numerically tiny prior mode from becoming an
+# arbitrarily strong penalty.
+LOSS_COEFF_SCALE_FLOOR = 0.25
+LOSS_SCALE_CHUNK_SIZE = 16
 
 # ============================================================
 # Learned upper-level relaxation
 # ============================================================
 
-# These control only the training loss.  No taper is applied at inference.
-UPPER_RELAX_START_HPA = 600.0
-UPPER_RELAX_TOP_HPA = 350.0
-UPPER_RELAX_LAMBDA = 0.1
-UPPER_RELAX_ND_SCALE = 100.0  # cm-3
+# These control only the training loss. No taper is applied at inference.
+# The relaxation uses the same LOSS_ND_SCALE as the site/campaign Nd MSE and
+# the whole-column anchor.
+UPPER_RELAX_START_HPA = 700.0
+UPPER_RELAX_TOP_HPA = 500.0
+UPPER_RELAX_LAMBDA = 1.0
 
 # ============================================================
 # Optimization
@@ -87,6 +102,7 @@ hp = {
     "nepochs": 3000,
     "batch_sz": 16,
     "l_r": 5e-5,
+    "weight_decay": 1e-5,
     "patience": 20,
 
     "model_name": MODEL_NAME,
@@ -97,29 +113,29 @@ hp = {
     "use_site_sampler": False,
     "min_sites_for_sampling": 1,
 
-    # Mean constraints
+    # Dimensionless deterministic constraints. Values near one now represent
+    # comparable order-one normalized objectives; lambdas are true tuning
+    # parameters rather than unit-conversion factors.
     "lambda_sites": 0.05,
     "lambda_anchor": 1.0,
     "lambda_anchor_decay": 1.0,
     "lambda_anchor_min": 0.1,
     "lambda_grad": 0.0,
-    "lambda_nd": 0.5,
+    "lambda_nd": 1.0,
     "lambda_campaign": 1.0,
 
-    # Probabilistic terms
+    # Dimensionless probabilistic terms. Gaussian likelihoods are written
+    # relative to fixed reference scales; sigma penalties use per-mode prior
+    # coefficient RMS rather than EOF amplitude.
     "lambda_Ndgauss": 0.25,
     "lambda_campaign_gauss": 0.20,
-    "lambda_sigma": 2.0,
+    "lambda_sigma": 1.0,
     "lambda_campaign_sigma": 1.0,
-    "sigma_mode_var_floor": 0.05,
     "min_sigma": 0.1,
     "detach_sigma_features": True,
 
-    # Learned-relax runs train the full V2 model.
-    "fine_tune_sigma": False,
-
-    # Do not add a campaign-only monitor when campaigns are excluded
-    # from training.
+    # Keep campaign monitoring explicit because campaign batches are sparse in
+    # time. The normalization does not remove sampling-frequency effects.
     "use_campaign_monitor": bool(TRAIN_WITH_CAMPAIGNS),
 }
 
@@ -171,9 +187,3 @@ num_modes = EOF.sizes["mode"]
 A_mean = np.load(BASEROOT + MODEL_BASE + "_coeff_mean.npy")
 A_mean = np.where(np.isnan(A_mean), 0.0, A_mean)
 Amean4 = A_mean[None, :, :, :]
-
-mode_var = np.sum(EOF.values**2, axis=1)
-mode_weights = torch.tensor(
-    mode_var / mode_var.mean(),
-    dtype=torch.float32,
-)
