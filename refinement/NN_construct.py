@@ -1,8 +1,7 @@
-"""V2 refinement model with learned upper-level relaxation.
+"""Public refinement model/loss interface for the dimensionless branch.
 
-The exact V2 implementation is retained in ``NN_construct_v2.py``.  This
-module re-exports that implementation and replaces only the loss class with
-the pressure-aware learned-relaxation subclass.
+The network architecture remains in ``NN_construct_v2.py``. The exported loss
+adds fixed dimensionless normalization and learned upper-level relaxation.
 """
 
 from NN_construct_v2 import *  # noqa: F401,F403
