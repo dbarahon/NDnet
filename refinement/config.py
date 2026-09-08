@@ -76,10 +76,9 @@ SAVE_RAW_TAPER_FIELDS = False
 # physical scale. A 100 cm-3 RMS error therefore contributes order unity.
 LOSS_ND_SCALE = 100.0  # cm-3
 
-# Coefficient-space likelihood and sigma terms are normalized by the
-# latitude-area-weighted RMS of each base residual coefficient over training
-# days. The floor prevents a numerically tiny prior mode from becoming an
-# arbitrarily strong penalty.
+# Coefficient-space sigma terms are normalized by the latitude-area-weighted
+# RMS of each base residual coefficient over training days. The floor prevents
+# a numerically tiny prior mode from becoming an arbitrarily strong penalty.
 LOSS_COEFF_SCALE_FLOOR = 0.25
 LOSS_SCALE_CHUNK_SIZE = 16
 
@@ -113,10 +112,8 @@ hp = {
     "use_site_sampler": False,
     "min_sites_for_sampling": 1,
 
-    # Dimensionless deterministic constraints. Values near one now represent
-    # comparable order-one normalized objectives; lambdas are true tuning
-    # parameters rather than unit-conversion factors.
-    "lambda_sites": 0.05,
+    # Deterministic constraints. All Nd-space terms use LOSS_ND_SCALE and are
+    # therefore directly comparable in physical units.
     "lambda_anchor": 1.0,
     "lambda_anchor_decay": 1.0,
     "lambda_anchor_min": 0.1,
@@ -124,9 +121,15 @@ hp = {
     "lambda_nd": 1.0,
     "lambda_campaign": 1.0,
 
-    # Dimensionless probabilistic terms. Gaussian likelihoods are written
-    # relative to fixed reference scales; sigma penalties use per-mode prior
-    # coefficient RMS rather than EOF amplitude.
+    # Optional projected-coefficient Gaussian site likelihood. This target is
+    # inferred from sparse site profiles rather than observed directly, and a
+    # Gaussian NLL can be arbitrarily large when predicted sigma is initially
+    # small. It is therefore OFF in the publication-oriented objective. Site
+    # information is retained through lambda_nd and lambda_Ndgauss.
+    "lambda_site_coeff_gauss": 0.0,
+
+    # Probabilistic terms. Nd Gaussian likelihoods are unit-independent;
+    # coefficient sigma penalties use per-mode prior coefficient RMS.
     "lambda_Ndgauss": 0.25,
     "lambda_campaign_gauss": 0.20,
     "lambda_sigma": 1.0,
