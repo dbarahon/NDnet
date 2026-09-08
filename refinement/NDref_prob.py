@@ -1,80 +1,18 @@
-"""Learned-upper-relax refinement driver.
+"""NDnet probabilistic refinement workflow with dimensionless loss scaling.
 
-The heavy site/campaign diagnostic implementation lives in
-``refinement_driver.py``. This module keeps experiment controls explicit:
-training initialization and whether campaigns participate in training are
-independent from the site/campaign diagnostic switches.
+Training initialization is explicit: no runtime monkey-patching of driver
+functions is used. Site, campaign, and global diagnostics continue to use the
+shared refinement driver and raw network output.
 """
 
 from __future__ import annotations
-
-import os
 
 import torch
 import torch.multiprocessing as mp
 
 import config as cfg
 import refinement_driver as core
-
-
-_VALID_INIT_MODES = {"weights", "scratch", "resume"}
-
-
-def _install_training_initialization():
-    """Apply the configured initialization policy without altering V2 code."""
-    mode = str(getattr(cfg, "TRAIN_INIT_MODE", "resume")).strip().lower()
-    if mode not in _VALID_INIT_MODES:
-        raise ValueError(
-            f"Unknown TRAIN_INIT_MODE={mode!r}; expected one of "
-            f"{sorted(_VALID_INIT_MODES)}"
-        )
-
-    if mode == "resume":
-        print("[INIT] mode=resume: use current checkpoint when available")
-        return
-
-    if bool(cfg.hp.get("fine_tune_sigma", False)):
-        raise ValueError(
-            "TRAIN_INIT_MODE='weights'/'scratch' is for full-model training; "
-            "disable fine_tune_sigma or use TRAIN_INIT_MODE='resume'."
-        )
-
-    if mode == "scratch":
-        def _start_fresh(model, optimizer, ckpt_path, device):
-            print(
-                f"[INIT] mode=scratch: ignoring checkpoint {ckpt_path}; "
-                "using random model initialization"
-            )
-            return 0
-
-        core.load_training_checkpoint = _start_fresh
-        return
-
-    source = str(getattr(cfg, "TRAIN_INIT_WEIGHTS", "")).strip()
-    if not source:
-        raise ValueError(
-            "TRAIN_INIT_MODE='weights' requires TRAIN_INIT_WEIGHTS."
-        )
-    if not os.path.exists(source):
-        raise FileNotFoundError(
-            f"[INIT] requested initialization weights not found: {source}"
-        )
-
-    def _start_from_weights(model, optimizer, ckpt_path, device):
-        print(
-            f"[INIT] mode=weights: ignoring checkpoint {ckpt_path}; "
-            f"loading {source}"
-        )
-        core.load_model_weights_for_inference(
-            model,
-            source,
-            device=device,
-            strict=True,
-            eval_mode=False,
-        )
-        return 0
-
-    core.load_training_checkpoint = _start_from_weights
+from dimensionless_training import train_dimensionless_refinement_model
 
 
 def _training_state(state):
@@ -99,10 +37,14 @@ def main():
 
     print("Using DataParallel on", numgpu, "GPUs")
     print(
+        f"[LOSS-SCALE] Nd={cfg.LOSS_ND_SCALE:g} cm-3; "
+        f"coefficient floor={cfg.LOSS_COEFF_SCALE_FLOOR:g}"
+    )
+    print(
         f"[RELAX] lambda={cfg.UPPER_RELAX_LAMBDA:g} "
         f"start={cfg.UPPER_RELAX_START_HPA:g} hPa "
-        f"top={cfg.UPPER_RELAX_TOP_HPA:g} hPa "
-        f"scale={cfg.UPPER_RELAX_ND_SCALE:g} cm-3"
+        f"top={cfg.UPPER_RELAX_TOP_HPA:g} hPa; "
+        "same Nd scale as observational losses"
     )
     print("[RELAX] raw NN output is used at diagnostics and production inference")
     print(
@@ -114,17 +56,12 @@ def main():
         f"{str(getattr(cfg, 'TRAIN_INIT_MODE', 'resume')).lower()}"
     )
 
+    run_model_name = cfg.MODEL_NAME
     if cfg.do_train:
-        run_model_name = core.active_model_name(cfg.hp)
-        print(
-            f"[MODE] training enabled; "
-            f"fine_tune_sigma={bool(cfg.hp.get('fine_tune_sigma', False))}"
-        )
-        print(f"[MODE] active training/output model = {run_model_name}")
+        print("[MODE] dimensionless full-model training enabled")
     else:
-        run_model_name = cfg.MODEL_NAME
         print("[MODE] do_train=False -> frozen evaluation only")
-        print(f"[MODE] evaluation model = {run_model_name}")
+    print(f"[MODE] model = {run_model_name}")
 
     site_cache_hit = False
     campaign_cache_hit = False
@@ -171,8 +108,7 @@ def main():
         )
 
     if cfg.do_train:
-        _install_training_initialization()
-        model, run_model_name = core.train_refinement_model(
+        model, run_model_name = train_dimensionless_refinement_model(
             _training_state(state),
             device,
             numgpu,
@@ -180,7 +116,6 @@ def main():
         )
         need_sites_compute = bool(cfg.do_sites)
         need_campaigns_compute = bool(cfg.do_campaigns)
-
     elif need_sites_compute or need_campaigns_compute:
         model = core.load_frozen_model(
             state,
