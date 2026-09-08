@@ -62,9 +62,18 @@ def initialize_training_model(model, optimizer, *, device, model_name):
 
 
 def _write_loss_scale_metadata(model_name, coeff_scales, n_training_days):
-    """Persist the fixed normalization constants used by a training run."""
+    """Persist normalization constants and objective settings for the run."""
+    lambdas = {
+        key: float(value)
+        for key, value in cfg.hp.items()
+        if key.startswith("lambda_") and isinstance(value, (int, float))
+    }
+    lambdas["lambda_upper_relax"] = float(cfg.UPPER_RELAX_LAMBDA)
+
     payload = {
         "schema": "NDnet dimensionless loss scales v1",
+        "model_name": str(model_name),
+        "training_init_mode": str(getattr(cfg, "TRAIN_INIT_MODE", "resume")),
         "nd_loss_scale_cm3": float(cfg.LOSS_ND_SCALE),
         "coefficient_scale_definition": (
             "latitude-area-weighted RMS of base residual EOF coefficients "
@@ -81,6 +90,9 @@ def _write_loss_scale_metadata(model_name, coeff_scales, n_training_days):
             "log-pressure-weighted upper-column mean squared Nd departure "
             "from base, divided by the same nd_loss_scale_cm3^2"
         ),
+        "upper_relax_start_hpa": float(cfg.UPPER_RELAX_START_HPA),
+        "upper_relax_top_hpa": float(cfg.UPPER_RELAX_TOP_HPA),
+        "lambdas": lambdas,
     }
     path = model_name + "_loss_scales.json"
     with open(path, "w", encoding="utf-8") as f:
