@@ -1,154 +1,253 @@
 import os
 import time
-from contextlib import nullcontext
 
-import numpy as np
 import torch
+import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import config as cfg
-from utils import *
+from utils import log_train_event
+
+
+run_id = os.environ.get("RUN_ID", "run0")
+job_id = os.environ.get("SLURM_JOB_ID", os.environ.get("PBS_JOBID", "nojid"))
+rank = int(os.environ.get("RANK", "0"))
+
+
+class StepTimer:
+    def __init__(self, device="cuda"):
+        self.device = device
+        self.reset()
+
+    def reset(self):
+        self.t = {}
+        self._t0 = None
+
+    def tic(self, key):
+        if self.device.startswith("cuda"):
+            torch.cuda.synchronize()
+        self._t0 = time.time()
+        self._key = key
+
+    def toc(self):
+        if self.device.startswith("cuda"):
+            torch.cuda.synchronize()
+        self.t[self._key] = self.t.get(self._key, 0.0) + (time.time() - self._t0)
+
+    def report(self, prefix="", denom=1):
+        msg = " | ".join([f"{k}:{self.t[k] / denom:.3f}s" for k in self.t])
+        print(f"{prefix}{msg}")
+
+
+def move_to(x, device):
+    if isinstance(x, torch.Tensor):
+        return x.to(device, non_blocking=True)
+    return x
 
 
 def _move_batch_to_device(batch, device):
-    out = {}
-    for key, value in batch.items():
-        if isinstance(value, torch.Tensor):
-            out[key] = value.to(device, non_blocking=True)
-        else:
-            out[key] = value
-    return out
+    if isinstance(batch, dict):
+        return {k: move_to(v, device) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return tuple(move_to(x, device) for x in batch)
+    raise TypeError(f"Unsupported batch type: {type(batch)}")
 
 
 def _extract_model_inputs(batch):
-    return batch["x2d"], batch["mu0"]
+    """Return x2d and mu0 from legacy tuples or multi-observation dicts."""
+    if isinstance(batch, dict):
+        return batch["x2d"], batch["mu0"]
+
+    x2d, mu0, _, _, _, _ = batch
+    return x2d, mu0
 
 
 def _criterion_from_batch(criterion, mu, sigma, batch, return_parts=False):
-    kwargs = {
-        "dA": mu,
-        "sigma": sigma,
-        "yS": batch.get("ys"),
-        "vS": batch.get("vs"),
-        "mu0": batch.get("mu0"),
-        "Nd_obs_sites": batch.get("nds"),
-        "Eds": batch.get("eds"),
-        "seg_batch_idx": batch.get("seg_batch_idx"),
-        "seg_ilat": batch.get("seg_ilat"),
-        "seg_ilon": batch.get("seg_ilon"),
-        "seg_p": batch.get("seg_p"),
-        "seg_y": batch.get("seg_y"),
-        "seg_y_std": batch.get("seg_y_std"),
-        "seg_valid_obs": batch.get("seg_valid_obs"),
-        "seg_campaign_id": batch.get("seg_campaign_id"),
-        "seg_group_id": batch.get("seg_group_id"),
-        "return_parts": return_parts,
-    }
-    return criterion(**kwargs)
+    """Bridge legacy site tuples and site/campaign dictionary batches."""
+    if isinstance(batch, dict):
+        yS = batch.get("yS")
+        Nds = batch.get("Nds")
+        Eds = batch.get("Eds")
+        seg_y = batch.get("seg_y")
+        seg_y_std = batch.get("seg_y_std")
+
+        return criterion(
+            mu.float(),
+            sigma.float(),
+            yS.float() if isinstance(yS, torch.Tensor) else yS,
+            batch.get("vS"),
+            batch["mu0"].float(),
+            Nds.float() if isinstance(Nds, torch.Tensor) else Nds,
+            Eds.float() if isinstance(Eds, torch.Tensor) else Eds,
+            seg_batch_idx=batch.get("seg_batch_idx"),
+            seg_ilat=batch.get("seg_ilat"),
+            seg_ilon=batch.get("seg_ilon"),
+            seg_p=batch.get("seg_p"),
+            seg_y=seg_y.float() if isinstance(seg_y, torch.Tensor) else seg_y,
+            seg_y_std=(
+                seg_y_std.float()
+                if isinstance(seg_y_std, torch.Tensor)
+                else seg_y_std
+            ),
+            seg_valid_obs=batch.get("seg_valid_obs"),
+            seg_campaign_id=batch.get("seg_campaign_id"),
+            seg_group_id=batch.get("seg_flight_id"),
+            return_parts=return_parts,
+        )
+
+    x2d, mu0, yS, vS, Nds, Eds = batch
+    return criterion(
+        mu.float(),
+        sigma.float(),
+        yS.float(),
+        vS,
+        mu0.float(),
+        Nds.float(),
+        Eds.float(),
+        return_parts=return_parts,
+    )
 
 
-def _state_dict_for_save(model):
-    return model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+def save_model_weights(model, path):
+    sd = (
+        model.module.state_dict()
+        if isinstance(model, nn.DataParallel)
+        else model.state_dict()
+    )
+    torch.save(sd, path)
+    print(f"[SAVE] Model weights saved to {path}")
 
 
-def save_universal_checkpoint(model, optimizer, epoch, ckpt_path):
-    payload = {
-        "epoch": int(epoch),
-        "model_state_dict": _state_dict_for_save(model),
-        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
-    }
-    torch.save(payload, ckpt_path)
-    print(f"[CKPT] Saved universal checkpoint at epoch {epoch}: {ckpt_path}")
+def _strip_module_prefix(sd):
+    if any(k.startswith("module.") for k in sd):
+        return {k[len("module."):]: v for k, v in sd.items()}
+    return sd
+
+
+def _add_module_prefix(sd):
+    if not any(k.startswith("module.") for k in sd):
+        return {"module." + k: v for k, v in sd.items()}
+    return sd
+
+
+def save_training_checkpoint(model, optimizer, epoch, path):
+    sd = _strip_module_prefix(model.state_dict())
+    torch.save(
+        {
+            "epoch": int(epoch),
+            "model_state_dict": sd,
+            "optimizer_state_dict": optimizer.state_dict(),
+        },
+        path,
+    )
+    print(f"[CKPT] Saved universal checkpoint at epoch {epoch}: {path}")
 
 
 def load_training_checkpoint(model, optimizer, ckpt_path, device):
     if not os.path.exists(ckpt_path):
-        print(f"[CKPT] no checkpoint at {ckpt_path}; starting from epoch 0")
+        print("[CKPT] No training checkpoint found")
         return 0
 
-    payload = torch.load(ckpt_path, map_location=device)
-    state = payload.get("model_state_dict", payload)
-    target = model.module if isinstance(model, torch.nn.DataParallel) else model
-    target.load_state_dict(state, strict=True)
+    print(f"[CKPT] Loading checkpoint: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    sd = ckpt["model_state_dict"]
 
-    if optimizer is not None and payload.get("optimizer_state_dict") is not None:
-        optimizer.load_state_dict(payload["optimizer_state_dict"])
+    if isinstance(model, nn.DataParallel):
+        sd = _add_module_prefix(sd)
+    else:
+        sd = _strip_module_prefix(sd)
 
-    epoch = int(payload.get("epoch", -1))
-    print(f"[CKPT] resumed {ckpt_path} from epoch {epoch}")
-    return epoch + 1
+    model.load_state_dict(sd, strict=True)
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
-
-def save_model_weights(model, path):
-    torch.save(_state_dict_for_save(model), path)
-    print(f"[SAVE] Model weights saved to {path}")
+    start_epoch = int(ckpt["epoch"]) + 1
+    print(f"[CKPT] Resuming from epoch {start_epoch}")
+    return start_epoch
 
 
 def load_model_weights_for_inference(
     model,
     weights_path,
-    *,
-    device,
+    device="cuda",
     strict=True,
     eval_mode=True,
+    verbose=True,
 ):
+    device = (
+        torch.device(device)
+        if not isinstance(device, torch.device)
+        else device
+    )
+
     if not os.path.exists(weights_path):
-        raise FileNotFoundError(weights_path)
+        raise FileNotFoundError(f"Weights file not found: {weights_path}")
 
-    state = torch.load(weights_path, map_location=device)
-    if isinstance(state, dict) and "model_state_dict" in state:
-        state = state["model_state_dict"]
+    model = model.to(device)
 
-    target = model.module if isinstance(model, torch.nn.DataParallel) else model
-    target.load_state_dict(state, strict=strict)
+    if verbose:
+        dp_infer = isinstance(model, nn.DataParallel)
+        print(f"[WEIGHTS] Loading: {weights_path}")
+        print(
+            f"[WEIGHTS] Target device: {device}, "
+            f"DataParallel model: {dp_infer}, strict={strict}"
+        )
+
+    sd = torch.load(weights_path, map_location=device, weights_only=False)
+    if isinstance(sd, dict) and "model_state_dict" in sd:
+        sd = sd["model_state_dict"]
+
+    if isinstance(model, nn.DataParallel):
+        sd = _add_module_prefix(sd)
+    else:
+        sd = _strip_module_prefix(sd)
+
+    missing, unexpected = model.load_state_dict(sd, strict=strict)
+
+    if verbose:
+        if missing:
+            suffix = " ..." if len(missing) > 8 else ""
+            print(f"[WEIGHTS] Missing keys ({len(missing)}): {missing[:8]}{suffix}")
+        if unexpected:
+            suffix = " ..." if len(unexpected) > 8 else ""
+            print(
+                f"[WEIGHTS] Unexpected keys ({len(unexpected)}): "
+                f"{unexpected[:8]}{suffix}"
+            )
+        print("[WEIGHTS] Load OK")
+
     if eval_mode:
         model.eval()
+
     return model
 
 
-def run_infer_x_mu0(device, loader, model, use_amp=True):
-    model.eval()
-    mu_all = []
-    sig_all = []
-    amp_enabled = use_amp and device.type == "cuda"
-
-    with torch.no_grad():
-        for batch in loader:
-            batch = _move_batch_to_device(batch, device)
-            x2d, mu0 = _extract_model_inputs(batch)
-            with autocast(device_type="cuda", enabled=amp_enabled):
-                mu, sigma = model(x2d, mu0)
-            mu_all.append(mu.detach().cpu())
-            sig_all.append(sigma.detach().cpu())
-
-    if not mu_all:
-        return np.empty((0,)), np.empty((0,))
-    return torch.cat(mu_all, dim=0).numpy(), torch.cat(sig_all, dim=0).numpy()
-
-
+@torch.no_grad()
 def _eval_loop(model, criterion, loader, device, use_amp=True):
+    """Return full validation loss averaged over batches."""
     model.eval()
-    amp_enabled = use_amp and device.type == "cuda"
     val_sum = 0.0
     val_n = 0
+    amp_enabled = use_amp and device.type == "cuda"
 
-    with torch.no_grad():
-        for batch in loader:
-            batch = _move_batch_to_device(batch, device)
-            x2d, mu0 = _extract_model_inputs(batch)
-            with autocast(device_type="cuda", enabled=amp_enabled):
-                mu, sigma = model(x2d, mu0)
-            with autocast(device_type="cuda", enabled=False):
-                loss = _criterion_from_batch(
-                    criterion,
-                    mu,
-                    sigma,
-                    batch,
-                    return_parts=False,
-                )
-            val_sum += float(loss.detach().item())
-            val_n += 1
+    for batch in loader:
+        batch = _move_batch_to_device(batch, device)
+        x2d, mu0 = _extract_model_inputs(batch)
+
+        with autocast(device_type="cuda", enabled=amp_enabled):
+            mu, sigma = model(x2d, mu0)
+
+        with autocast(device_type="cuda", enabled=False):
+            loss = _criterion_from_batch(
+                criterion,
+                mu,
+                sigma,
+                batch,
+                return_parts=False,
+            )
+
+        val_sum += float(loss.detach().item())
+        val_n += 1
 
     return val_sum / max(val_n, 1)
 
@@ -430,19 +529,24 @@ def training_val(
                 "n_campaign_monitor_batches": int(n_campaign_batches),
                 "t_train_s": float(t_train),
                 "t_val_s": float(t_val),
-                "t_camp_eval_s": float(t_camp_eval),
+                "t_campaign_eval_s": float(t_camp_eval),
                 "lr": float(optimizer.param_groups[0]["lr"]),
             },
             write_csv=True,
             write_jsonl=True,
         )
 
-        improved = monitor_loss < best_monitor
-        if improved:
+        train_losses.append(train_loss)
+        val_losses.append(monitor_loss)
+
+        if monitor_loss < best_monitor:
             best_monitor = monitor_loss
             bad_epochs = 0
-            save_model_weights(model, hp["model_name"] + "_weights.pt")
-            save_universal_checkpoint(
+            save_model_weights(
+                model,
+                hp["model_name"] + "_weights.pt",
+            )
+            save_training_checkpoint(
                 model,
                 optimizer,
                 epoch,
@@ -450,12 +554,40 @@ def training_val(
             )
         else:
             bad_epochs += 1
-
-        if bad_epochs >= int(hp.get("patience", 20)):
-            print(
-                f"[EARLY-STOP] no monitor improvement for {bad_epochs} epochs",
-                flush=True,
-            )
-            break
+            if bad_epochs >= hp["patience"]:
+                print("[EARLY] Early stopping", flush=True)
+                break
 
     return train_losses, val_losses
+
+
+@torch.no_grad()
+def run_infer_x_mu0(
+    device,
+    loader,
+    model,
+    use_amp=True,
+    return_sigma=True,
+):
+    model.eval()
+    mu_list = []
+    sig_list = []
+    amp_enabled = use_amp and device.type == "cuda"
+
+    for batch in loader:
+        batch = _move_batch_to_device(batch, device)
+        x2d, mu0 = _extract_model_inputs(batch)
+
+        with autocast(device_type="cuda", enabled=amp_enabled):
+            mu, sigma = model(x2d, mu0)
+
+        mu_list.append(mu.detach().cpu())
+        if return_sigma:
+            sig_list.append(sigma.detach().cpu())
+
+    mu = torch.cat(mu_list, dim=0).numpy().astype("float32")
+    if not return_sigma:
+        return mu
+
+    sig = torch.cat(sig_list, dim=0).numpy().astype("float32")
+    return mu, sig
