@@ -1,10 +1,8 @@
-"""Public refinement model/loss interface for the dimensionless branch.
+"""Public network architecture interface for refinement workflows.
 
-The network architecture remains in ``NN_construct_v2.py``. The exported loss
-adds fixed dimensionless normalization and learned upper-level relaxation.
+The model implementation remains in ``NN_construct_v2.py``. Training modules
+import their loss explicitly so the active scientific objective is visible at
+the call site rather than installed through an alias.
 """
 
 from NN_construct_v2 import *  # noqa: F401,F403
-from NN_relax import SparseSiteCampaignNLLRefineLossRelax
-
-SparseSiteCampaignNLLRefineLoss = SparseSiteCampaignNLLRefineLossRelax
