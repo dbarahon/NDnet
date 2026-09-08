@@ -90,6 +90,11 @@ def _write_loss_scale_metadata(model_name, coeff_scales, n_training_days):
             "log-pressure-weighted upper-column mean squared Nd departure "
             "from base, divided by the same nd_loss_scale_cm3^2"
         ),
+        "site_coeff_gaussian_definition": (
+            "optional Gaussian likelihood against coefficients projected from "
+            "site profiles; disabled by default because coefficients are not "
+            "direct observations and this NLL has no bounded order-one scale"
+        ),
         "upper_relax_start_hpa": float(cfg.UPPER_RELAX_START_HPA),
         "upper_relax_top_hpa": float(cfg.UPPER_RELAX_TOP_HPA),
         "lambdas": lambdas,
@@ -121,6 +126,18 @@ def train_dimensionless_refinement_model(state, device, numgpu, numwork):
         "[LOSS-SCALE] prior coefficient RMS by mode = "
         + np.array2string(coeff_scales, precision=4, separator=", ")
     )
+    print(
+        "[LOSS] weights: "
+        f"siteNd={cfg.hp.get('lambda_nd', 1.0):g} "
+        f"siteNdG={cfg.hp.get('lambda_Ndgauss', 0.25):g} "
+        f"campNd={cfg.hp.get('lambda_campaign', 1.0):g} "
+        f"campNdG={cfg.hp.get('lambda_campaign_gauss', 0.20):g} "
+        f"anchor={cfg.hp.get('lambda_anchor', 1.0):g} "
+        f"upper={cfg.UPPER_RELAX_LAMBDA:g} "
+        f"siteCoeffG={cfg.hp.get('lambda_site_coeff_gauss', 0.0):g} "
+        f"sigSite={cfg.hp.get('lambda_sigma', 1.0):g} "
+        f"sigCamp={cfg.hp.get('lambda_campaign_sigma', 1.0):g}"
+    )
     _write_loss_scale_metadata(cfg.MODEL_NAME, coeff_scales, n_training_days)
 
     criterion = SparseSiteCampaignNLLRefineLossRelax(
@@ -137,7 +154,10 @@ def train_dimensionless_refinement_model(state, device, numgpu, numwork):
         nd_loss_scale=float(cfg.LOSS_ND_SCALE),
         lambda_grad=float(cfg.hp.get("lambda_grad", 0.0)),
         lambda_anchor=float(cfg.hp.get("lambda_anchor", 1.0)),
-        lambda_sites=float(cfg.hp.get("lambda_sites", 0.05)),
+        # Historical internal name retained by NN_construct_v2. In the
+        # dimensionless/public configuration this is explicitly the optional
+        # projected-coefficient Gaussian site likelihood.
+        lambda_sites=float(cfg.hp.get("lambda_site_coeff_gauss", 0.0)),
         lambda_nd=float(cfg.hp.get("lambda_nd", 1.0)),
         lambda_Ndgauss=float(cfg.hp.get("lambda_Ndgauss", 0.25)),
         lambda_campaign=float(cfg.hp.get("lambda_campaign", 1.0)),
