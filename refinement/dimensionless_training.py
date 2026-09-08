@@ -16,7 +16,7 @@ import torch.optim as optim
 
 import config as cfg
 import refinement_driver as core
-from NN_construct import SparseSiteCampaignNLLRefineLoss
+from NN_relax import SparseSiteCampaignNLLRefineLossRelax
 from loss_normalization import estimate_base_coefficient_scales
 from train_infer import (
     load_model_weights_for_inference,
@@ -111,7 +111,7 @@ def train_dimensionless_refinement_model(state, device, numgpu, numwork):
     )
     _write_loss_scale_metadata(cfg.MODEL_NAME, coeff_scales, n_training_days)
 
-    criterion = SparseSiteCampaignNLLRefineLoss(
+    criterion = SparseSiteCampaignNLLRefineLossRelax(
         lat_grid=state["Nin_2d"].lat.values,
         site_meta=state["site_meta"],
         # Dimensionless coefficient terms use coeff_scales, so no additional
