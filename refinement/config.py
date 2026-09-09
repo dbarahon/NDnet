@@ -83,15 +83,18 @@ LOSS_COEFF_SCALE_FLOOR = 0.25
 LOSS_SCALE_CHUNK_SIZE = 16
 
 # ============================================================
-# Learned upper-level relaxation
+# Scale-separated upper-level relaxation
 # ============================================================
 
-# These control only the training loss. No taper is applied at inference.
-# The relaxation uses the same LOSS_ND_SCALE as the site/campaign Nd MSE and
-# the whole-column anchor.
+# These controls affect training only; no taper is applied at inference.
+# The correction dA-mu0 is separated into a longitude mean and a longitude
+# anomaly before applying the same pressure-space Gram metric. The zonal term
+# suppresses broad latitude-band artifacts, while the weak anomaly term still
+# allows local high-altitude corrections where sites/campaigns provide support.
 UPPER_RELAX_START_HPA = 700.0
 UPPER_RELAX_TOP_HPA = 500.0
-UPPER_RELAX_LAMBDA = 1.0
+UPPER_RELAX_ZONAL_LAMBDA = 10.0
+UPPER_RELAX_ANOMALY_LAMBDA = 0.1
 
 # ============================================================
 # Optimization
