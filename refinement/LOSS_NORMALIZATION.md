@@ -79,9 +79,23 @@ does not allocate a full `(batch, level, lat, lon)` correction tensor.
 ## Upper relaxation
 
 The upper relaxation uses the same Nd-space metric after multiplying the
-log-pressure integration weights by the configured pressure ramp. Therefore
-`lambda_anchor`, `lambda_nd`, `lambda_campaign`, and `UPPER_RELAX_LAMBDA` all
-multiply dimensionless squared departures measured against the same Nd scale.
+log-pressure integration weights by the configured pressure ramp. The upper
+correction is separated into its longitude mean and longitude anomaly before
+that metric is evaluated:
+
+`L_upper = UPPER_RELAX_ZONAL_LAMBDA * L_upper_zonal`
+
+`        + UPPER_RELAX_ANOMALY_LAMBDA * L_upper_anomaly`.
+
+The zonal term constrains broad latitude-band departures from the prior. The
+anomaly term constrains only local deviations from that longitude mean and is
+weak by default so sparse high-reaching observations can still modify their
+local profiles.
+
+Because both components use the same `LOSS_ND_SCALE`, `lambda_anchor`,
+`lambda_nd`, `lambda_campaign`, `UPPER_RELAX_ZONAL_LAMBDA`, and
+`UPPER_RELAX_ANOMALY_LAMBDA` all multiply dimensionless squared departures
+measured against the same physical reference.
 
 The anchor and upper-relaxation terms are expected to be very small at the
 start of a prior-centered refinement because `dA - mu0` is initially small.
