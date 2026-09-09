@@ -1,12 +1,17 @@
-"""Dimensionless learned upper-level relaxation for NDnet refinement.
+"""Scale-separated upper-level relaxation for NDnet refinement.
 
-The relaxation acts only during training. It penalizes the raw Nd departure
-from the base reconstruction at low pressure; no taper is applied to inference
-or diagnostic products.
+The regularizer acts only during training and never modifies inference output.
+It constrains the poorly observed large-scale upper-tropospheric correction
+while allowing local departures needed to fit high-reaching observations.
 
-This module builds on the dimensionless V2 loss so the whole-column anchor,
-site/campaign Nd MSE terms, and upper relaxation all use the same fixed Nd
-reference scale.
+For correction coefficients ``c = dA - mu0`` the Nd correction is
+
+    dNd(p) = sum_m c_m EOF_m(p).
+
+The correction is separated into a longitude mean and a longitude anomaly.
+The zonal-mean component is strongly regularized; the anomaly component can be
+regularized weakly or disabled. Both terms use the same fixed Nd reference
+scale and upper-pressure Gram matrix as the dimensionless objective.
 """
 
 from __future__ import annotations
@@ -23,17 +28,7 @@ from loss_normalization import (
 
 
 class SparseSiteCampaignNLLRefineLossRelax(_DimensionlessLoss):
-    """Dimensionless refinement loss plus pressure-dependent prior relaxation.
-
-    For ``c = dA - mu0`` the Nd correction is
-
-        dNd(p) = sum_m c_m EOF_m(p).
-
-    The regularizer is the log-pressure-weighted vertical mean of
-    ``(dNd / nd_loss_scale)^2`` after applying a 0--1 relaxation weight. The
-    weight is zero at and below ``UPPER_RELAX_START_HPA`` and reaches one at
-    and above ``UPPER_RELAX_TOP_HPA``.
-    """
+    """Dimensionless refinement loss with scale-separated upper relaxation."""
 
     def __init__(self, *args, **kwargs):
         EOF = kwargs.get("EOF", args[3] if len(args) > 3 else None)
@@ -42,7 +37,12 @@ class SparseSiteCampaignNLLRefineLossRelax(_DimensionlessLoss):
 
         super().__init__(*args, **kwargs)
 
-        self.lambda_upper_relax = float(getattr(cfg, "UPPER_RELAX_LAMBDA", 1.0))
+        self.lambda_upper_zonal = float(
+            getattr(cfg, "UPPER_RELAX_ZONAL_LAMBDA", 10.0)
+        )
+        self.lambda_upper_anomaly = float(
+            getattr(cfg, "UPPER_RELAX_ANOMALY_LAMBDA", 0.1)
+        )
         self.upper_relax_start_hpa = float(
             getattr(cfg, "UPPER_RELAX_START_HPA", 700.0)
         )
@@ -77,25 +77,57 @@ class SparseSiteCampaignNLLRefineLossRelax(_DimensionlessLoss):
             torch.as_tensor(integrated_w, dtype=torch.float32),
         )
 
-    def upper_relax_loss(self, dA, mu0):
-        """Area-weighted dimensionless upper-level Nd departure from base."""
+    def _upper_quadratic_zonal(self, corr):
+        """Area-weighted upper Nd penalty for the longitude-mean correction."""
+        # corr: (batch, mode, lat, lon). Longitude is averaged first so a
+        # localized observational correction is diluted rather than penalized
+        # as though it were a latitude-circle-wide departure from the prior.
+        corr_zonal = corr.mean(dim=-1)  # (batch, mode, lat)
+        q = torch.einsum(
+            "bmh,mn,bnh->bh",
+            corr_zonal,
+            self.upper_relax_G.float(),
+            corr_zonal,
+        )
+        q = torch.clamp(self._f32(q), min=0.0)
+        lat_w = self.lat_w_grid.view(1, -1).float()
+        return (q * lat_w).sum() / lat_w.expand_as(q).sum().clamp(min=1e-12)
+
+    def _upper_quadratic_anomaly(self, corr):
+        """Area-weighted upper Nd penalty for deviations from the zonal mean."""
+        corr_zonal = corr.mean(dim=-1, keepdim=True)
+        corr_anom = corr - corr_zonal
+        q = torch.einsum(
+            "bmhw,mn,bnhw->bhw",
+            corr_anom,
+            self.upper_relax_G.float(),
+            corr_anom,
+        )
+        q = torch.clamp(self._f32(q), min=0.0)
+        lat_w = self.lat_w_grid.view(1, -1, 1).float()
+        return (q * lat_w).sum() / lat_w.expand_as(q).sum().clamp(min=1e-12)
+
+    def upper_relax_components(self, dA, mu0):
+        """Return raw zonal-mean and anomaly upper-relaxation losses."""
         if mu0 is None:
-            return self._zero_like_sum(dA)
+            zero = self._zero_like_sum(dA)
+            return zero, zero
 
         corr = self._clip_abs(
             self._f32(dA) - self._f32(mu0),
             self.max_abs_coeff,
         )
-        q = torch.einsum(
-            "bmhw,mn,bnhw->bhw",
-            corr,
-            self.upper_relax_G.float(),
-            corr,
-        )
-        q = torch.clamp(self._f32(q), min=0.0)
+        zonal = self._upper_quadratic_zonal(corr)
+        anomaly = self._upper_quadratic_anomaly(corr)
+        return zonal, anomaly
 
-        lat_w = self.lat_w_grid.view(1, -1, 1).float()
-        return (q * lat_w).sum() / lat_w.expand_as(q).sum().clamp(min=1e-12)
+    def upper_relax_loss(self, dA, mu0):
+        """Return weighted scale-separated upper-relaxation loss."""
+        zonal, anomaly = self.upper_relax_components(dA, mu0)
+        return (
+            self.lambda_upper_zonal * zonal
+            + self.lambda_upper_anomaly * anomaly
+        )
 
     def forward(self, *args, return_parts=False, **kwargs):
         dA = args[0] if len(args) > 0 else kwargs.get("dA")
@@ -109,25 +141,41 @@ class SparseSiteCampaignNLLRefineLossRelax(_DimensionlessLoss):
             **kwargs,
         )
 
-        if self.lambda_upper_relax > 0.0 and mu0 is not None:
-            raw = self.upper_relax_loss(dA, mu0)
+        if (
+            (self.lambda_upper_zonal > 0.0 or self.lambda_upper_anomaly > 0.0)
+            and mu0 is not None
+        ):
+            raw_zonal, raw_anomaly = self.upper_relax_components(dA, mu0)
         else:
-            raw = self._zero_like_sum(dA)
+            raw_zonal = self._zero_like_sum(dA)
+            raw_anomaly = self._zero_like_sum(dA)
 
-        weighted = self.lambda_upper_relax * raw
+        weighted_zonal = self.lambda_upper_zonal * raw_zonal
+        weighted_anomaly = self.lambda_upper_anomaly * raw_anomaly
+        weighted = weighted_zonal + weighted_anomaly
         loss = base_loss + weighted
+
         if not torch.isfinite(loss):
             raise RuntimeError(
                 "Non-finite loss after upper relaxation: "
                 f"base={float(base_loss.detach().cpu())} "
-                f"upper_relax={float(weighted.detach().cpu())}"
+                f"upper_zonal={float(weighted_zonal.detach().cpu())} "
+                f"upper_anomaly={float(weighted_anomaly.detach().cpu())}"
             )
 
         if not return_parts:
             return loss
 
         parts = dict(parts)
+        # Retain total keys used by the existing training logger, and expose
+        # both components explicitly for reproducibility and diagnostics.
         parts["L_upper_relax"] = float(weighted.detach().cpu())
-        parts["L_upper_relax_raw"] = float(raw.detach().cpu())
+        parts["L_upper_relax_raw"] = float(
+            (raw_zonal + raw_anomaly).detach().cpu()
+        )
+        parts["L_upper_zonal"] = float(weighted_zonal.detach().cpu())
+        parts["L_upper_zonal_raw"] = float(raw_zonal.detach().cpu())
+        parts["L_upper_anomaly"] = float(weighted_anomaly.detach().cpu())
+        parts["L_upper_anomaly_raw"] = float(raw_anomaly.detach().cpu())
         parts["loss"] = float(loss.detach().cpu())
         return loss, parts
