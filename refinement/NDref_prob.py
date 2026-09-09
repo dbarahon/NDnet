@@ -41,12 +41,16 @@ def main():
         f"coefficient floor={cfg.LOSS_COEFF_SCALE_FLOOR:g}"
     )
     print(
-        f"[RELAX] lambda={cfg.UPPER_RELAX_LAMBDA:g} "
+        f"[RELAX] zonal_lambda={cfg.UPPER_RELAX_ZONAL_LAMBDA:g} "
+        f"anomaly_lambda={cfg.UPPER_RELAX_ANOMALY_LAMBDA:g} "
         f"start={cfg.UPPER_RELAX_START_HPA:g} hPa "
         f"top={cfg.UPPER_RELAX_TOP_HPA:g} hPa; "
         "same Nd scale as observational losses"
     )
-    print("[RELAX] raw NN output is used at diagnostics and production inference")
+    print(
+        "[RELAX] upper correction is split into longitude mean + local anomaly; "
+        "raw NN output is used at diagnostics and production inference"
+    )
     print(
         f"[TRAIN-DATA] TRAIN_WITH_CAMPAIGNS="
         f"{bool(getattr(cfg, 'TRAIN_WITH_CAMPAIGNS', True))}"
