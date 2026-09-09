@@ -68,10 +68,11 @@ def _write_loss_scale_metadata(model_name, coeff_scales, n_training_days):
         for key, value in cfg.hp.items()
         if key.startswith("lambda_") and isinstance(value, (int, float))
     }
-    lambdas["lambda_upper_relax"] = float(cfg.UPPER_RELAX_LAMBDA)
+    lambdas["lambda_upper_zonal"] = float(cfg.UPPER_RELAX_ZONAL_LAMBDA)
+    lambdas["lambda_upper_anomaly"] = float(cfg.UPPER_RELAX_ANOMALY_LAMBDA)
 
     payload = {
-        "schema": "NDnet dimensionless loss scales v1",
+        "schema": "NDnet dimensionless loss scales v2",
         "model_name": str(model_name),
         "training_init_mode": str(getattr(cfg, "TRAIN_INIT_MODE", "resume")),
         "nd_loss_scale_cm3": float(cfg.LOSS_ND_SCALE),
@@ -87,8 +88,9 @@ def _write_loss_scale_metadata(model_name, coeff_scales, n_training_days):
             "from base, divided by nd_loss_scale_cm3^2"
         ),
         "upper_relax_definition": (
-            "log-pressure-weighted upper-column mean squared Nd departure "
-            "from base, divided by the same nd_loss_scale_cm3^2"
+            "upper-column Nd correction separated into longitude mean and "
+            "longitude anomaly; both use the same log-pressure Gram metric "
+            "and nd_loss_scale_cm3, with independent fixed lambdas"
         ),
         "site_coeff_gaussian_definition": (
             "optional Gaussian likelihood against coefficients projected from "
@@ -133,7 +135,8 @@ def train_dimensionless_refinement_model(state, device, numgpu, numwork):
         f"campNd={cfg.hp.get('lambda_campaign', 1.0):g} "
         f"campNdG={cfg.hp.get('lambda_campaign_gauss', 0.20):g} "
         f"anchor={cfg.hp.get('lambda_anchor', 1.0):g} "
-        f"upper={cfg.UPPER_RELAX_LAMBDA:g} "
+        f"upperZonal={cfg.UPPER_RELAX_ZONAL_LAMBDA:g} "
+        f"upperAnom={cfg.UPPER_RELAX_ANOMALY_LAMBDA:g} "
         f"siteCoeffG={cfg.hp.get('lambda_site_coeff_gauss', 0.0):g} "
         f"sigSite={cfg.hp.get('lambda_sigma', 1.0):g} "
         f"sigCamp={cfg.hp.get('lambda_campaign_sigma', 1.0):g}"
