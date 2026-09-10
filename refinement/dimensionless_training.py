@@ -18,6 +18,7 @@ import config as cfg
 import refinement_driver as core
 from NN_relax import SparseSiteCampaignNLLRefineLossRelax
 from loss_normalization import estimate_base_coefficient_scales
+from pressure_weighting import linear_upper_pressure_weight
 from train_infer import (
     load_model_weights_for_inference,
     load_training_checkpoint,
@@ -61,6 +62,17 @@ def initialize_training_model(model, optimizer, *, device, model_name):
     return load_training_checkpoint(model, optimizer, checkpoint, device)
 
 
+def _site_pressure_weights():
+    """Return the fixed site-Nd pressure multipliers on the EOF levels."""
+    lev = np.asarray(getattr(cfg.EOF.lev, "values", cfg.EOF.lev), dtype=np.float64)
+    return lev, linear_upper_pressure_weight(
+        lev,
+        cfg.SITE_ND_PRESSURE_WEIGHT_START_HPA,
+        cfg.SITE_ND_PRESSURE_WEIGHT_TOP_HPA,
+        cfg.SITE_ND_PRESSURE_WEIGHT_TOP_FACTOR,
+    )
+
+
 def _write_loss_scale_metadata(model_name, coeff_scales, n_training_days):
     """Persist normalization constants and objective settings for the run."""
     lambdas = {
@@ -70,9 +82,10 @@ def _write_loss_scale_metadata(model_name, coeff_scales, n_training_days):
     }
     lambdas["lambda_upper_zonal"] = float(cfg.UPPER_RELAX_ZONAL_LAMBDA)
     lambdas["lambda_upper_anomaly"] = float(cfg.UPPER_RELAX_ANOMALY_LAMBDA)
+    site_lev, site_weight = _site_pressure_weights()
 
     payload = {
-        "schema": "NDnet dimensionless loss scales v2",
+        "schema": "NDnet dimensionless loss scales v3",
         "model_name": str(model_name),
         "training_init_mode": str(getattr(cfg, "TRAIN_INIT_MODE", "resume")),
         "nd_loss_scale_cm3": float(cfg.LOSS_ND_SCALE),
@@ -92,6 +105,19 @@ def _write_loss_scale_metadata(model_name, coeff_scales, n_training_days):
             "longitude anomaly; both use the same log-pressure Gram metric "
             "and nd_loss_scale_cm3, with independent fixed lambdas"
         ),
+        "site_nd_pressure_weighting": {
+            "applies_to": "direct deterministic site Nd MSE only",
+            "definition": (
+                "weight=1 at pressure >= start_hpa; linear in pressure to "
+                "top_factor at top_hpa; top_factor retained at lower pressure; "
+                "renormalized within each site before equal-site averaging"
+            ),
+            "start_hpa": float(cfg.SITE_ND_PRESSURE_WEIGHT_START_HPA),
+            "top_hpa": float(cfg.SITE_ND_PRESSURE_WEIGHT_TOP_HPA),
+            "top_factor": float(cfg.SITE_ND_PRESSURE_WEIGHT_TOP_FACTOR),
+            "pressure_hpa": [float(x) for x in site_lev],
+            "weights": [float(x) for x in site_weight],
+        },
         "site_coeff_gaussian_definition": (
             "optional Gaussian likelihood against coefficients projected from "
             "site profiles; disabled by default because coefficients are not "
@@ -127,6 +153,21 @@ def train_dimensionless_refinement_model(state, device, numgpu, numwork):
     print(
         "[LOSS-SCALE] prior coefficient RMS by mode = "
         + np.array2string(coeff_scales, precision=4, separator=", ")
+    )
+    site_lev, site_weight = _site_pressure_weights()
+    selected = site_lev <= cfg.SITE_ND_PRESSURE_WEIGHT_START_HPA
+    print(
+        "[SITE-ND-WEIGHT] linear pressure weighting: "
+        f"1x at >= {cfg.SITE_ND_PRESSURE_WEIGHT_START_HPA:g} hPa -> "
+        f"{cfg.SITE_ND_PRESSURE_WEIGHT_TOP_FACTOR:g}x at <= "
+        f"{cfg.SITE_ND_PRESSURE_WEIGHT_TOP_HPA:g} hPa; "
+        "site-normalized; Gaussian site Nd term unchanged"
+    )
+    print(
+        "[SITE-ND-WEIGHT] upper levels: "
+        + ", ".join(
+            f"{p:g}:{w:.2f}x" for p, w in zip(site_lev[selected], site_weight[selected])
+        )
     )
     print(
         "[LOSS] weights: "
