@@ -89,12 +89,31 @@ LOSS_SCALE_CHUNK_SIZE = 16
 # These controls affect training only; no taper is applied at inference.
 # The correction dA-mu0 is separated into a longitude mean and a longitude
 # anomaly before applying the same pressure-space Gram metric. The zonal term
-# suppresses broad latitude-band artifacts, while the weak anomaly term still
-# allows local high-altitude corrections where sites/campaigns provide support.
+# suppresses broad latitude-band artifacts. The anomaly term is disabled by
+# default so local high-altitude corrections can be driven by observations.
 UPPER_RELAX_START_HPA = 700.0
 UPPER_RELAX_TOP_HPA = 500.0
 UPPER_RELAX_ZONAL_LAMBDA = 10.0
-UPPER_RELAX_ANOMALY_LAMBDA = 0.1
+UPPER_RELAX_ANOMALY_LAMBDA = 0.0
+
+# ============================================================
+# Pressure weighting of direct site Nd loss
+# ============================================================
+
+# The direct fixed-site Nd MSE is reweighted smoothly with pressure so the few
+# sites with genuine upper-tropospheric observations retain leverage against
+# the zonal upper relaxation. The multiplier is 1 at and below 500 hPa,
+# increases linearly in pressure, and reaches 3 at 350 hPa. It remains 3 above
+# 350 hPa. The weighted loss is renormalized within each site, preserving the
+# equal-site hierarchy and avoiding a discrete pressure-level jump.
+#
+# With the default EOF levels the weights are:
+#   500: 1.00, 450: 1.67, 400: 2.33, 350: 3.00.
+# Only the deterministic site Nd MSE (lambda_nd) uses these weights; the site
+# Gaussian likelihood is left unchanged for this controlled adjustment.
+SITE_ND_PRESSURE_WEIGHT_START_HPA = 500.0
+SITE_ND_PRESSURE_WEIGHT_TOP_HPA = 350.0
+SITE_ND_PRESSURE_WEIGHT_TOP_FACTOR = 3.0
 
 # ============================================================
 # Optimization
