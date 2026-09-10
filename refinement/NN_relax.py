@@ -12,6 +12,11 @@ The correction is separated into a longitude mean and a longitude anomaly.
 The zonal-mean component is strongly regularized; the anomaly component can be
 regularized weakly or disabled. Both terms use the same fixed Nd reference
 scale and upper-pressure Gram matrix as the dimensionless objective.
+
+The direct site Nd MSE can additionally be reweighted smoothly with pressure.
+This gives observed upper-level site values more leverage against the zonal
+constraint without introducing a step at a model level. The pressure weights
+are normalized within each site, so the equal-site hierarchy is preserved.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from loss_normalization import (
     build_nd_gram,
     linear_logp_relax_weight,
 )
+from pressure_weighting import linear_upper_pressure_weight
 
 
 class SparseSiteCampaignNLLRefineLossRelax(_DimensionlessLoss):
@@ -41,13 +47,23 @@ class SparseSiteCampaignNLLRefineLossRelax(_DimensionlessLoss):
             getattr(cfg, "UPPER_RELAX_ZONAL_LAMBDA", 10.0)
         )
         self.lambda_upper_anomaly = float(
-            getattr(cfg, "UPPER_RELAX_ANOMALY_LAMBDA", 0.1)
+            getattr(cfg, "UPPER_RELAX_ANOMALY_LAMBDA", 0.0)
         )
         self.upper_relax_start_hpa = float(
             getattr(cfg, "UPPER_RELAX_START_HPA", 700.0)
         )
         self.upper_relax_top_hpa = float(
             getattr(cfg, "UPPER_RELAX_TOP_HPA", 500.0)
+        )
+
+        self.site_nd_weight_start_hpa = float(
+            getattr(cfg, "SITE_ND_PRESSURE_WEIGHT_START_HPA", 500.0)
+        )
+        self.site_nd_weight_top_hpa = float(
+            getattr(cfg, "SITE_ND_PRESSURE_WEIGHT_TOP_HPA", 350.0)
+        )
+        self.site_nd_weight_top_factor = float(
+            getattr(cfg, "SITE_ND_PRESSURE_WEIGHT_TOP_FACTOR", 3.0)
         )
 
         lev = np.asarray(getattr(EOF.lev, "values", EOF.lev), dtype=np.float64)
@@ -63,6 +79,12 @@ class SparseSiteCampaignNLLRefineLossRelax(_DimensionlessLoss):
             self.nd_loss_scale,
             level_modifier=relax_w,
         )
+        site_nd_w = linear_upper_pressure_weight(
+            lev,
+            self.site_nd_weight_start_hpa,
+            self.site_nd_weight_top_hpa,
+            self.site_nd_weight_top_factor,
+        )
 
         self.register_buffer(
             "upper_relax_G",
@@ -76,6 +98,60 @@ class SparseSiteCampaignNLLRefineLossRelax(_DimensionlessLoss):
             "upper_relax_integrated_weight_lev",
             torch.as_tensor(integrated_w, dtype=torch.float32),
         )
+        self.register_buffer(
+            "site_nd_pressure_weight_lev",
+            torch.as_tensor(site_nd_w, dtype=torch.float32),
+        )
+
+    def masked_mse_Nd_equal_sites(self, Nd_pred, Nd_obs, vS, Eds=None):
+        """Pressure-weighted, dimensionless site Nd MSE with equal site weight.
+
+        The pressure multiplier is applied only to the direct deterministic
+        site Nd MSE. Each site's numerator is divided by its own weighted
+        valid-observation sum, so a site with upper-level data does not gain
+        extra total weight merely because its pressure weights are larger.
+        The Gaussian site likelihood is intentionally left unchanged.
+        """
+        vS = vS.bool()
+        finite = torch.isfinite(Nd_obs) & torch.isfinite(Nd_pred)
+        if self.nd_require_vS:
+            finite = finite & vS[:, None, :]
+
+        cnt_s = finite.sum(dim=(0, 1))
+        valid_site = cnt_s >= self.min_valid_points
+        if int(valid_site.sum().detach().cpu().item()) < 1:
+            return None
+
+        pred = torch.clamp(self._f32(Nd_pred), min=0.0, max=self.max_abs_nd)
+        obs = torch.clamp(self._f32(Nd_obs), min=0.0, max=self.max_abs_nd)
+        diff = torch.clamp(pred - obs, min=-self.max_abs_nd, max=self.max_abs_nd)
+        diff2 = (diff / self.nd_loss_scale).square()
+        diff2 = torch.where(finite, diff2, torch.zeros_like(diff2))
+
+        pweight = self.site_nd_pressure_weight_lev.view(1, -1, 1).float()
+        weighted_valid = pweight * finite.float()
+        num_u = (pweight * diff2).sum(dim=(0, 1))
+        if self.normalize_nd_loss:
+            den_u = weighted_valid.sum(dim=(0, 1)).clamp(min=1e-12)
+            loss_u = num_u / den_u
+        else:
+            loss_u = num_u
+
+        w = self._nd_error_weights(Eds, finite)
+        if w is None or self.err_mix <= 0.0:
+            loss_s = loss_u
+        else:
+            combined_w = w * pweight
+            num_w = (combined_w * diff2).sum(dim=(0, 1))
+            if self.normalize_nd_loss:
+                den_w = (combined_w * finite.float()).sum(dim=(0, 1)).clamp(min=1e-12)
+                loss_w = num_w / den_w
+            else:
+                loss_w = num_w
+            a = self.err_mix
+            loss_s = (1.0 - a) * loss_u + a * loss_w
+
+        return loss_s[valid_site].mean()
 
     def _upper_quadratic_zonal(self, corr):
         """Area-weighted upper Nd penalty for the longitude-mean correction."""
