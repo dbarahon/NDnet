@@ -52,11 +52,12 @@ SIGMA_VAR = "sigmaNd"
 LOG_SCATTER_AXES = True
 MIN_ND_COMPARE = 1.0
 
-# Optional plot limits. Set to None for automatic.
-XMAX_SCATTER = 1000
-YMAX_SCATTER = XMAX_SCATTER
-XMIN_SCATTER = 10
-YMIN_SCATTER = XMIN_SCATTER
+# Optional scatter limits. Set any bound to None for automatic scaling.
+# The same limits are applied to x and y so the 1:1 comparison stays square.
+ND_SCATTER_MIN = 10
+ND_SCATTER_MAX = 1000
+SIGMA_SCATTER_MIN = 10
+SIGMA_SCATTER_MAX = 1000
 
 MIN_COD_COMPARE = 0.1
 
@@ -342,20 +343,37 @@ def global_scatter_limits(dfs, obs_col: str, model_col: str, log_axes=False):
         return lo * 0.9, hi * 1.1
 
     hi = np.nanmax(vals)
-    if XMAX_SCATTER is not None:
-        hi = max(hi, XMAX_SCATTER)
-    if YMAX_SCATTER is not None:
-        hi = max(hi, YMAX_SCATTER)
     return 0.0, hi * 1.05
 
 
 def scatter_limits(dfs, obs_col, model_col, log_axes=False):
-    """Use configured limits where supplied, otherwise fall back to the data."""
+    """Use variable-specific configured limits, with data-driven fallback."""
     auto_lo, auto_hi = global_scatter_limits(
         dfs, obs_col, model_col, log_axes=log_axes
     )
-    lo = XMIN_SCATTER if XMIN_SCATTER is not None else auto_lo
-    hi = XMAX_SCATTER if XMAX_SCATTER is not None else auto_hi
+
+    if obs_col == "Nd_obs":
+        configured_lo = ND_SCATTER_MIN
+        configured_hi = ND_SCATTER_MAX
+    elif obs_col == "sigma_obs":
+        configured_lo = SIGMA_SCATTER_MIN
+        configured_hi = SIGMA_SCATTER_MAX
+    else:
+        configured_lo = None
+        configured_hi = None
+
+    lo = configured_lo if configured_lo is not None else auto_lo
+    hi = configured_hi if configured_hi is not None else auto_hi
+
+    if lo >= hi:
+        raise ValueError(
+            f"Invalid scatter limits for {obs_col}: min={lo} must be < max={hi}"
+        )
+    if log_axes and lo <= 0:
+        raise ValueError(
+            f"Log scatter axes require a positive minimum for {obs_col}; got {lo}"
+        )
+
     return float(lo), float(hi)
 
 
