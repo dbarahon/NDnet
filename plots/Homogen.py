@@ -26,10 +26,18 @@ zonal-mean row evaluates the same diagnostics cumulatively from 1000 hPa to a
 variable layer-top pressure p. Its plotted p coordinate runs from 950 hPa to
 200 hPa by default and is linear in pressure.
 
+The fixed map layers retain the strict validity rule: every integration node
+must be valid. The zonal cumulative row is deliberately NaN-aware. It integrates
+only trapezoid segments whose two endpoints are valid and normalizes each
+moment by the valid Delta ln(p), rather than by the nominal full layer depth.
+Missing vertical intervals are therefore skipped rather than invalidating the
+entire cumulative 1000-p layer, and gaps are never bridged by a trapezoid.
+
 For the zonal row, each daily 3-D diagnostic is first averaged across longitude.
 The plotted H and R are temporal medians of those daily zonal means. The plotted
 f is the temporal mean of the daily zonal fraction of valid longitudes for which
-H exceeds --threshold.
+H exceeds --threshold. These horizontal and temporal aggregations are also
+NaN-aware.
 
 All vertical integrations use trapezoidal integration in ln(p). If an exact
 boundary does not coincide with a model pressure level, Nd and sigmaNd are
@@ -49,9 +57,9 @@ Workflow
 The map climatology is evaluated in spatial tiles, allowing exact temporal
 medians without loading the complete multi-year 4-D array into memory. Zonal
 products are stored compactly in the same annual files as (time, pressure, lat).
-Because zonal f depends on the H threshold, changing --threshold requires the
-annual intermediates to be recomputed; compute/all detects and rebuilds stale
-files automatically.
+Because zonal f depends on the H threshold, and because the zonal integration
+algorithm is versioned, compute/all detects and rebuilds stale annual files
+automatically.
 """
 
 import argparse
@@ -112,11 +120,16 @@ ZONAL_PLOT_TOP_HPA = 200.0
 ZONAL_PRESSURE_TICKS = [950, 850, 700, 500, 300, 200]
 ZONAL_LAT_TICKS = [-90, -60, -30, 0, 30, 60, 90]
 
-# A daily layer is accepted only when Nd is finite at every integration node.
-# This avoids silently integrating across missing vertical portions.
-MIN_ND = 1.0                 # cm^-3 at every integration node
+# Fixed map layers remain strict: every integration node must be valid.
+MIN_ND = 1.0                 # cm^-3
 MIN_LAYER_MEAN_ND = 1.0      # cm^-3
 MIN_SIGMA_RMS = 1.0e-6       # avoid division by zero in R
+
+# For the zonal cumulative row, NaN gaps are skipped segment-by-segment. Set
+# this above zero only if you later want to require a minimum fraction of the
+# nominal 1000-p ln-pressure depth to be observed. 0.0 means: retain any layer
+# containing at least one valid trapezoid segment.
+MIN_ZONAL_VALID_LNP_FRACTION = 0.0
 
 # Intermediate annual output. Fixed-layer map H/R plus compact zonal products.
 ANNUAL_OUT_DIR = "H_lnp_annual"
@@ -124,7 +137,6 @@ ANNUAL_PREFIX = "Nd_vertical_H_lnp"
 OVERWRITE_ANNUAL = False
 
 # Parallelism is across years, so workers never write the same file.
-# 4 is intentionally conservative for a shared parallel filesystem.
 N_WORKERS = 4
 
 # NetCDF compression/chunking. These chunks also align with plotting tiles.
@@ -168,6 +180,8 @@ ZONAL_H_VAR = "zonal_H"
 ZONAL_F_VAR = "zonal_f"
 ZONAL_R_VAR = "zonal_R"
 ZONAL_THRESHOLD_ATTR = "zonal_exceedance_threshold_percent"
+ZONAL_ALGORITHM_VERSION_ATTR = "zonal_algorithm_version"
+ZONAL_ALGORITHM_VERSION = 2
 
 
 # ============================================================
@@ -513,64 +527,148 @@ def _build_zonal_profile_spec(p_source_hpa):
     }
 
 
-def _reverse_segment_integral(values, x_nodes):
-    """Trapezoidal integrals from every node i to the final node."""
+def _reverse_valid_segment_integrals(values, valid_nodes, x_nodes):
+    """
+    Cumulative trapezoidal integral and valid ln(p) support from each node down.
+
+    A segment contributes only when both endpoints are valid. Consequently,
+    isolated NaNs create a gap but do not poison the entire cumulative layer,
+    and the integration never bridges across an unsupported interval.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    valid_nodes = np.asarray(valid_nodes, dtype=bool)
+    x_nodes = np.asarray(x_nodes, dtype=np.float64)
+
     dx = np.diff(x_nodes)[:, None, None]
-    segments = 0.5 * (values[:-1] + values[1:]) * dx
-    return np.cumsum(segments[::-1, :, :], axis=0)[::-1, :, :]
+    valid_segment = valid_nodes[:-1] & valid_nodes[1:]
+
+    safe_values = np.where(valid_nodes, values, 0.0)
+    segment_integral = (
+        0.5 * (safe_values[:-1] + safe_values[1:]) * dx
+    )
+    segment_integral = np.where(valid_segment, segment_integral, 0.0)
+    segment_support = np.where(valid_segment, dx, 0.0)
+
+    cumulative_integral = np.cumsum(
+        segment_integral[::-1, :, :], axis=0
+    )[::-1, :, :]
+    cumulative_support = np.cumsum(
+        segment_support[::-1, :, :], axis=0
+    )[::-1, :, :]
+
+    return cumulative_integral, cumulative_support
+
+
+def _safe_supported_mean(integral, support):
+    """Return integral/support where support is positive; NaN elsewhere."""
+    out = np.full(integral.shape, np.nan, dtype=np.float64)
+    np.divide(integral, support, out=out, where=support > 0.0)
+    return out
+
+
+def _support_is_sufficient(support, nominal_span):
+    """Validity mask for the configured minimum zonal ln(p) support fraction."""
+    support = np.asarray(support, dtype=np.float64)
+    nominal_span = np.asarray(nominal_span, dtype=np.float64)
+    fraction = np.zeros_like(support, dtype=np.float64)
+    np.divide(support, nominal_span, out=fraction, where=nominal_span > 0.0)
+    return (support > 0.0) & (fraction >= MIN_ZONAL_VALID_LNP_FRACTION)
 
 
 def _compute_zonal_profile_H_R(nd, sigma, spec):
     """
-    Compute H and R for all [p, 1000 hPa] layers in one cumulative pass.
+    Compute NaN-aware H and R for all cumulative [p, 1000 hPa] layers.
+
+    H uses all valid Nd trapezoid segments. R is evaluated on the common
+    vertical support where both Nd and sigmaNd are valid, so numerator and
+    denominator always refer to the same sampled ln(p) intervals.
 
     Returns arrays shaped (zonal_level, lat, lon).
     """
-    nd_nodes = _interp_to_nodes(nd, spec)
-    sigma_nodes = _interp_to_nodes(sigma, spec)
+    nd_nodes = _interp_to_nodes(nd, spec).astype(np.float64, copy=False)
+    sigma_nodes = _interp_to_nodes(sigma, spec).astype(np.float64, copy=False)
     x_nodes = spec["x_nodes"]
     idx = spec["top_indices"]
 
-    int_nd = _reverse_segment_integral(nd_nodes, x_nodes)
-    int_nd2 = _reverse_segment_integral(nd_nodes * nd_nodes, x_nodes)
-    int_sigma2 = _reverse_segment_integral(sigma_nodes * sigma_nodes, x_nodes)
+    nominal_span = (x_nodes[-1] - x_nodes[idx])[:, None, None]
 
-    span = (x_nodes[-1] - x_nodes[idx])[:, None, None]
-    nd_mean = int_nd[idx] / span
-    nd_second = int_nd2[idx] / span
+    # --------------------------------------------------------
+    # H: use valid Nd segments only.
+    # --------------------------------------------------------
+    valid_nd_nodes = np.isfinite(nd_nodes) & (nd_nodes >= MIN_ND)
+
+    int_nd, nd_support = _reverse_valid_segment_integrals(
+        nd_nodes, valid_nd_nodes, x_nodes
+    )
+    int_nd2, nd2_support = _reverse_valid_segment_integrals(
+        nd_nodes * nd_nodes, valid_nd_nodes, x_nodes
+    )
+
+    # nd_support and nd2_support are constructed from the same validity mask.
+    # Keep the explicit check because it guards future edits to this routine.
+    if not np.allclose(nd_support, nd2_support, rtol=0.0, atol=1.0e-12):
+        raise RuntimeError("Internal error: Nd moment supports do not match.")
+
+    h_support = nd_support[idx]
+    nd_mean = _safe_supported_mean(int_nd[idx], h_support)
+    nd_second = _safe_supported_mean(int_nd2[idx], h_support)
     variance = np.maximum(nd_second - nd_mean * nd_mean, 0.0)
     nd_vertical_rms = np.sqrt(variance)
 
-    valid_nd_nodes = np.isfinite(nd_nodes) & (nd_nodes >= MIN_ND)
-    valid_nd_from_node = np.logical_and.accumulate(
-        valid_nd_nodes[::-1, :, :], axis=0
-    )[::-1, :, :]
-    valid_nd = valid_nd_from_node[idx]
-    valid_nd &= np.isfinite(nd_mean) & (nd_mean >= MIN_LAYER_MEAN_ND)
+    valid_H = _support_is_sufficient(h_support, nominal_span)
+    valid_H &= np.isfinite(nd_mean) & (nd_mean >= MIN_LAYER_MEAN_ND)
+    valid_H &= np.isfinite(nd_vertical_rms)
 
     H = np.full(nd_mean.shape, np.nan, dtype=np.float32)
-    H[valid_nd] = (
-        100.0 * nd_vertical_rms[valid_nd] / nd_mean[valid_nd]
+    H[valid_H] = (
+        100.0 * nd_vertical_rms[valid_H] / nd_mean[valid_H]
     ).astype(np.float32)
 
-    sigma_rms = np.sqrt(int_sigma2[idx] / span)
+    # --------------------------------------------------------
+    # R: use common Nd + sigmaNd support for all moments.
+    # --------------------------------------------------------
     valid_sigma_nodes = np.isfinite(sigma_nodes) & (sigma_nodes >= 0.0)
-    valid_sigma_from_node = np.logical_and.accumulate(
-        valid_sigma_nodes[::-1, :, :], axis=0
-    )[::-1, :, :]
-    valid_R = valid_nd & valid_sigma_from_node[idx]
+    valid_common_nodes = valid_nd_nodes & valid_sigma_nodes
+
+    int_nd_common, common_support = _reverse_valid_segment_integrals(
+        nd_nodes, valid_common_nodes, x_nodes
+    )
+    int_nd2_common, common_support2 = _reverse_valid_segment_integrals(
+        nd_nodes * nd_nodes, valid_common_nodes, x_nodes
+    )
+    int_sigma2, sigma_support = _reverse_valid_segment_integrals(
+        sigma_nodes * sigma_nodes, valid_common_nodes, x_nodes
+    )
+
+    if (
+        not np.allclose(common_support, common_support2, rtol=0.0, atol=1.0e-12)
+        or not np.allclose(common_support, sigma_support, rtol=0.0, atol=1.0e-12)
+    ):
+        raise RuntimeError("Internal error: common Nd/sigma supports do not match.")
+
+    r_support = common_support[idx]
+    nd_mean_r = _safe_supported_mean(int_nd_common[idx], r_support)
+    nd_second_r = _safe_supported_mean(int_nd2_common[idx], r_support)
+    variance_r = np.maximum(nd_second_r - nd_mean_r * nd_mean_r, 0.0)
+    nd_vertical_rms_r = np.sqrt(variance_r)
+    sigma_second = _safe_supported_mean(int_sigma2[idx], r_support)
+    sigma_rms = np.sqrt(np.maximum(sigma_second, 0.0))
+
+    valid_R = _support_is_sufficient(r_support, nominal_span)
+    valid_R &= np.isfinite(nd_mean_r) & (nd_mean_r >= MIN_LAYER_MEAN_ND)
+    valid_R &= np.isfinite(nd_vertical_rms_r)
     valid_R &= np.isfinite(sigma_rms) & (sigma_rms > MIN_SIGMA_RMS)
 
-    R = np.full(nd_mean.shape, np.nan, dtype=np.float32)
+    R = np.full(nd_mean_r.shape, np.nan, dtype=np.float32)
     R[valid_R] = (
-        nd_vertical_rms[valid_R] / sigma_rms[valid_R]
+        nd_vertical_rms_r[valid_R] / sigma_rms[valid_R]
     ).astype(np.float32)
 
     return H, R
 
 
 def _daily_zonal_diagnostics(H_profile, R_profile, threshold):
-    """Return daily zonal H mean, exceedance fraction f, and R mean."""
+    """Return daily NaN-aware zonal H mean, exceedance fraction f, and R mean."""
     H_zonal, hcount = _nanmean_last_axis(H_profile)
     R_zonal, _ = _nanmean_last_axis(R_profile)
 
@@ -685,6 +783,9 @@ def _create_annual_output(path, year, lat, lon, zonal_pressures, threshold):
     )
     zh.units = "%"
     zh.long_name = "daily zonal mean H for cumulative [p, 1000 hPa] layers"
+    zh.nan_policy = (
+        "skip invalid trapezoid segments; normalize moments by valid ln(p) support"
+    )
 
     zf = nc.createVariable(
         ZONAL_F_VAR,
@@ -704,6 +805,9 @@ def _create_annual_output(path, year, lat, lon, zonal_pressures, threshold):
     )
     zr.units = "1"
     zr.long_name = "daily zonal mean R for cumulative [p, 1000 hPa] layers"
+    zr.nan_policy = (
+        "use common valid Nd/sigmaNd trapezoid support; normalize by valid ln(p) support"
+    )
 
     nc.setncattr("year", int(year))
     nc.setncattr("integration_coordinate", "ln(pressure)")
@@ -711,15 +815,22 @@ def _create_annual_output(path, year, lat, lon, zonal_pressures, threshold):
     nc.setncattr("minimum_Nd_cm-3", float(MIN_ND))
     nc.setncattr("minimum_layer_mean_Nd_cm-3", float(MIN_LAYER_MEAN_ND))
     nc.setncattr("zonal_integration_bottom_hpa", float(ZONAL_INTEGRATION_BOTTOM_HPA))
+    nc.setncattr("zonal_minimum_valid_lnp_fraction", float(MIN_ZONAL_VALID_LNP_FRACTION))
     nc.setncattr(ZONAL_THRESHOLD_ATTR, float(threshold))
+    nc.setncattr(ZONAL_ALGORITHM_VERSION_ATTR, int(ZONAL_ALGORITHM_VERSION))
     nc.setncattr(
-        "zonal_aggregation",
-        "daily longitude mean for H/R; daily longitude fraction for f; "
-        "plot uses temporal median H/R and temporal mean f",
+        "zonal_nan_policy",
+        "invalid vertical trapezoid segments are skipped and moments are normalized "
+        "by valid ln(p) support; no interpolation is performed across a NaN gap",
     )
     nc.setncattr(
-        "validity_requirement",
-        "Nd must be finite and >= minimum Nd at every integration node; "
+        "zonal_aggregation",
+        "daily NaN-aware longitude mean for H/R; daily valid-longitude fraction "
+        "for f; plot uses temporal NaN-median H/R and temporal NaN-mean f",
+    )
+    nc.setncattr(
+        "fixed_map_validity_requirement",
+        "Nd must be finite and >= minimum Nd at every fixed-layer integration node; "
         "R additionally requires finite nonnegative sigmaNd at every node",
     )
 
@@ -727,7 +838,7 @@ def _create_annual_output(path, year, lat, lon, zonal_pressures, threshold):
 
 
 def _annual_file_is_current(path, zonal_pressures, threshold):
-    """Return True only if an existing annual file contains the new zonal data."""
+    """Return True only if an existing annual file contains current zonal data."""
     if not os.path.exists(path):
         return False
     try:
@@ -737,8 +848,23 @@ def _annual_file_is_current(path, zonal_pressures, threshold):
                 return False
             if not hasattr(nc, ZONAL_THRESHOLD_ATTR):
                 return False
+            if not hasattr(nc, ZONAL_ALGORITHM_VERSION_ATTR):
+                return False
+            stored_version = int(getattr(nc, ZONAL_ALGORITHM_VERSION_ATTR))
+            if stored_version != ZONAL_ALGORITHM_VERSION:
+                return False
             stored_threshold = float(getattr(nc, ZONAL_THRESHOLD_ATTR))
             if not np.isclose(stored_threshold, threshold, rtol=0.0, atol=1.0e-6):
+                return False
+            stored_fraction = float(
+                getattr(nc, "zonal_minimum_valid_lnp_fraction", np.nan)
+            )
+            if not np.isclose(
+                stored_fraction,
+                MIN_ZONAL_VALID_LNP_FRACTION,
+                rtol=0.0,
+                atol=1.0e-12,
+            ):
                 return False
             stored_p = np.asarray(nc.variables[ZONAL_LEVEL_VAR][:], dtype=np.float64)
             return stored_p.shape == np.shape(zonal_pressures) and np.allclose(
@@ -851,6 +977,7 @@ def compute_all_years(threshold, workers=N_WORKERS):
     print(
         f"Zonal layers: {ZONAL_INTEGRATION_BOTTOM_HPA:g} hPa to variable p; "
         f"plot p={ZONAL_PLOT_BOTTOM_HPA:g}..{ZONAL_PLOT_TOP_HPA:g} hPa; "
+        f"NaN-aware valid-support fraction >= {MIN_ZONAL_VALID_LNP_FRACTION:g}; "
         f"f threshold={threshold:g}%"
     )
 
@@ -1055,6 +1182,11 @@ def _check_zonal_annual_files(datasets, threshold):
             "Annual files do not record the zonal f threshold. Recompute them "
             f"with --threshold {threshold:g}."
         )
+    if not hasattr(first, ZONAL_ALGORITHM_VERSION_ATTR):
+        raise ValueError(
+            "Annual files use the old strict-NaN zonal calculation. Recompute "
+            "them with mode compute/all to use the NaN-aware cumulative integrals."
+        )
 
     p0 = np.asarray(first.variables[ZONAL_LEVEL_VAR][:], dtype=np.float64)
     for nc in datasets:
@@ -1062,12 +1194,35 @@ def _check_zonal_annual_files(datasets, threshold):
             raise ValueError(
                 f"{nc.filepath()} is missing zonal diagnostics. Recompute annual files."
             )
+        stored_version = int(
+            getattr(nc, ZONAL_ALGORITHM_VERSION_ATTR, -1)
+        )
+        if stored_version != ZONAL_ALGORITHM_VERSION:
+            raise ValueError(
+                f"{nc.filepath()} stores zonal algorithm version {stored_version}, "
+                f"but this script requires version {ZONAL_ALGORITHM_VERSION}. "
+                "Re-run compute/all."
+            )
         stored_threshold = float(getattr(nc, ZONAL_THRESHOLD_ATTR, np.nan))
         if not np.isclose(stored_threshold, threshold, rtol=0.0, atol=1.0e-6):
             raise ValueError(
                 f"{nc.filepath()} stores zonal f for threshold "
                 f"{stored_threshold:g}%, but the requested plot threshold is "
                 f"{threshold:g}%. Re-run compute/all with the new threshold."
+            )
+        stored_fraction = float(
+            getattr(nc, "zonal_minimum_valid_lnp_fraction", np.nan)
+        )
+        if not np.isclose(
+            stored_fraction,
+            MIN_ZONAL_VALID_LNP_FRACTION,
+            rtol=0.0,
+            atol=1.0e-12,
+        ):
+            raise ValueError(
+                f"{nc.filepath()} was computed with zonal valid-support fraction "
+                f"{stored_fraction:g}, but the script requests "
+                f"{MIN_ZONAL_VALID_LNP_FRACTION:g}. Re-run compute/all."
             )
         p = np.asarray(nc.variables[ZONAL_LEVEL_VAR][:], dtype=np.float64)
         if p.shape != p0.shape or not np.allclose(p, p0, rtol=0.0, atol=1.0e-5):
@@ -1078,7 +1233,7 @@ def _check_zonal_annual_files(datasets, threshold):
 
 
 def calculate_zonal_climatology(threshold):
-    """Temporal climatology of the compact daily zonal products."""
+    """Temporal NaN-aware climatology of the compact daily zonal products."""
     files = _annual_files()
     datasets = [Dataset(_quiet_path(f), "r") for f in files]
 
@@ -1126,7 +1281,8 @@ def calculate_zonal_climatology(threshold):
 
         print(
             f"Zonal climatology from {ntime} daily records; "
-            f"integration bottom={ZONAL_INTEGRATION_BOTTOM_HPA:g} hPa."
+            f"integration bottom={ZONAL_INTEGRATION_BOTTOM_HPA:g} hPa; "
+            "NaN-aware vertical support."
         )
         return lat, p, H, f, R
 
@@ -1396,6 +1552,8 @@ def main():
 
     if args.threshold < 0.0:
         parser.error("--threshold must be nonnegative")
+    if not (0.0 <= MIN_ZONAL_VALID_LNP_FRACTION <= 1.0):
+        parser.error("MIN_ZONAL_VALID_LNP_FRACTION must lie in [0, 1]")
 
     if args.mode in ("compute", "all"):
         compute_all_years(threshold=args.threshold, workers=args.workers)
