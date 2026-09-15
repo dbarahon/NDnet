@@ -434,15 +434,25 @@ def plot(means: xr.Dataset, counts: xr.Dataset, mode: str, outdir: Path, basenam
 
         c1 = fig.add_subplot(cbgs[row][0, 0:2])
         cb1 = fig.colorbar(meshes[0], cax=c1, orientation="horizontal")
-        cb1.set_label(long_name if units == "1" else f"{long_name} ({units})", labelpad=1.5)
+        cb1.ax.xaxis.set_label_position("top")
+        cb1.ax.xaxis.set_ticks_position("bottom")
+        cb1.set_label(
+            long_name if units == "1" else f"{long_name} ({units})",
+            labelpad=3.0,
+        )
         cb1.ax.tick_params(length=2.5, pad=1.3)
 
         c2 = fig.add_subplot(cbgs[row][0, 2])
         cb2 = fig.colorbar(meshes[2], cax=c2, orientation="horizontal", extend="both")
+        cb2.ax.xaxis.set_label_position("top")
+        cb2.ax.xaxis.set_ticks_position("bottom")
         if mode == "absolute":
-            cb2.set_label("Retrieval - COSP" if dunits == "1" else f"Retrieval - COSP ({dunits})", labelpad=1.5)
+            cb2.set_label(
+                "Retrieval - COSP" if dunits == "1" else f"Retrieval - COSP ({dunits})",
+                labelpad=3.0,
+            )
         else:
-            cb2.set_label("Relative difference (%)", labelpad=1.5)
+            cb2.set_label("Relative difference (%)", labelpad=3.0)
         cb2.ax.tick_params(length=2.5, pad=1.3)
 
         n = np.asarray(counts[key], float)
