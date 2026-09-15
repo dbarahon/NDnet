@@ -5,7 +5,9 @@ Rows: liquid optical thickness, liquid particle size, liquid retrieval fraction,
 cloud-top pressure. Columns: GiOcean/COSP, MODIS retrieval, retrieval-COSP.
 The default 2000-2019 window matches the prior training selection. Only common
 dates and colocated finite values are used. COSP is bilinearly regridded to the
-refinement/Nd grid. Values are plotted in physical (unstandardized) units.
+refinement/Nd grid. Values are plotted in common physical (unstandardized)
+units. No standardization information is added to the figure; instead, a CSV
+and stdout table quantify the COSP-to-MODIS domain shift.
 
 Examples
 --------
@@ -34,7 +36,9 @@ from cartopy.util import add_cyclic_point
 # -----------------------------------------------------------------------------
 # Settings
 # -----------------------------------------------------------------------------
-ROOT = Path("/panfs/ccds02/nobackup/people/dbarahon/NDnet/data/dailies")
+DATA_ROOT = Path("/panfs/ccds02/nobackup/people/dbarahon/NDnet/data")
+ROOT = DATA_ROOT / "dailies"
+STATS_DIR = DATA_ROOT / "stats"
 PRIOR_DIR = ROOT / "mod_inst_6hr_glo_L720x361_sfc"
 RETR_DIR = ROOT / "MCD06COSP_D3_MODIS" / "on_Noutgrid"
 RETR_GLOB = "MCD06COSP_D3_MODIS.*.nc"
@@ -46,7 +50,7 @@ DIFF_MODE = "absolute"  # absolute | percentage
 OUT_BASENAME = "MODIS_input_comparison"
 DPI = 400
 
-# key: prior variable, retrieval variable, plot label, long label, units
+# key: prior variable, retrieval variable, plot label, long label, common units
 VARS = {
     "tau": (
         "MDSOPTHCKWTR", "Cloud_Optical_Thickness_Liquid_Mean",
@@ -64,6 +68,14 @@ VARS = {
         "SWCLDPRS", "Cloud_Top_Pressure_Mean",
         r"$p_{\rm c}$", "Cloud-top pressure", "hPa",
     ),
+}
+
+# MODIS normalization actually used by NDinfer_base/refinement/production inference.
+MODIS_NORM = {
+    "tau": (13.945, 9.665),
+    "reff": (12.08, 3.126),
+    "frac": (0.268, 0.205),
+    "ctp": (551.241, 177.277),
 }
 
 # Common absolute scale for columns 1-2. None = robust 2-98 percentile.
@@ -138,26 +150,47 @@ def prep(ds: xr.Dataset, y0: int, y1: int) -> xr.Dataset:
     return ds.sel(time=slice(f"{y0}-01-01", f"{y1}-12-31"))
 
 
-def convert(key: str, da: xr.DataArray) -> xr.DataArray:
-    """Put the few potentially ambiguous fields into refinement physical units."""
-    out = da.astype("float32")
-    u = str(da.attrs.get("units", "")).lower().replace(" ", "")
-    sample = np.asarray(out.isel(time=0).values, float)
+def _unit_factor(key: str, units: str, representative: float) -> float:
+    """Multiplicative factor to the common units used by refinement/MODIS."""
+    u = str(units or "").lower().replace(" ", "")
+    rep = abs(float(representative)) if np.isfinite(representative) else np.nan
 
-    if key == "ctp" and (u in {"pa", "pascal", "pascals"} or np.nanmedian(sample) > 2000):
-        out = out / 100.0
-    elif key == "frac" and ("%" in u or "percent" in u or np.nanpercentile(sample, 95) > 1.5):
-        out = out / 100.0
-    elif key == "reff":
+    if key == "reff":
         if u in {"m", "meter", "meters", "metre", "metres"}:
-            out = out * 1e6
-        elif u in {"mm", "millimeter", "millimeters"}:
-            out = out * 1e3
-    return out
+            return 1.0e6
+        if u in {"mm", "millimeter", "millimeters", "millimetre", "millimetres"}:
+            return 1.0e3
+        if u in {"um", "micron", "microns", "micrometer", "micrometers", "micrometre", "micrometres", "µm", "μm"}:
+            return 1.0
+        if np.isfinite(rep) and rep < 1.0e-3:
+            return 1.0e6
+
+    if key == "ctp":
+        if u in {"pa", "pascal", "pascals"}:
+            return 1.0e-2
+        if np.isfinite(rep) and rep > 2000.0:
+            return 1.0e-2
+
+    if key == "frac":
+        if "%" in u or "percent" in u:
+            return 1.0e-2
+        if np.isfinite(rep) and rep > 1.5:
+            return 1.0e-2
+
+    return 1.0
+
+
+def convert(key: str, da: xr.DataArray) -> xr.DataArray:
+    """Convert fields to common physical units before plotting/differencing."""
+    out = da.astype("float32")
+    sample = np.asarray(out.isel(time=0).values, float)
+    finite = sample[np.isfinite(sample)]
+    representative = float(np.nanmedian(finite)) if finite.size else np.nan
+    factor = _unit_factor(key, da.attrs.get("units", ""), representative)
+    return out * factor
 
 
 def canonical(ds: xr.Dataset, source: int) -> xr.Dataset:
-    # source=0 -> prior field name; source=1 -> retrieval field name
     return xr.Dataset({k: convert(k, ds[meta[source]]).rename(k) for k, meta in VARS.items()})
 
 
@@ -180,23 +213,133 @@ def regrid_prior(prior: xr.Dataset, retr: xr.Dataset) -> xr.Dataset:
     return r(prior).assign_coords(lat=retr.lat, lon=retr.lon)
 
 
-def paired_means(prior: xr.Dataset, retr: xr.Dataset) -> tuple[xr.Dataset, xr.Dataset]:
+def _normalization_stats() -> pd.DataFrame:
+    """Read the exact COSP prior normalization and compare with MODIS constants."""
+    rows = []
+    for key, meta in VARS.items():
+        pvar, rvar, _, long_name, units = meta
+        path = STATS_DIR / f"{pvar}_stats.nc4"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing prior normalization file: {path}")
+
+        with xr.open_dataset(path) as ds:
+            mname = f"{pvar}_mean"
+            sname = f"{pvar}_std"
+            if mname not in ds or sname not in ds:
+                raise KeyError(f"Expected {mname} and {sname} in {path}")
+            mu_raw = float(ds[mname].mean().values)
+            sd_raw = float(ds[sname].mean().values)
+            stat_units = ds[mname].attrs.get("units", ds[sname].attrs.get("units", ""))
+
+        factor = _unit_factor(key, stat_units, mu_raw)
+        mu_cosp = mu_raw * factor
+        sd_cosp = sd_raw * abs(factor)
+        mu_modis, sd_modis = MODIS_NORM[key]
+
+        rows.append({
+            "key": key,
+            "quantity": long_name,
+            "common_units": units,
+            "cosp_variable": pvar,
+            "modis_variable": rvar,
+            "cosp_norm_mean": mu_cosp,
+            "cosp_norm_std": sd_cosp,
+            "modis_norm_mean": mu_modis,
+            "modis_norm_std": sd_modis,
+            "norm_mean_delta_modis_minus_cosp": mu_modis - mu_cosp,
+            "norm_mean_shift_in_cosp_sigma": (mu_modis - mu_cosp) / sd_cosp,
+            "norm_std_ratio_modis_over_cosp": sd_modis / sd_cosp,
+        })
+    return pd.DataFrame(rows)
+
+
+def paired_products(prior: xr.Dataset, retr: xr.Dataset):
+    """Paired climatology maps, support counts, and common-period moments."""
     prior, retr = xr.align(prior, retr, join="inner")
     if prior.sizes["time"] == 0:
         raise RuntimeError("No common dates")
-    print(f"Common dates: {prior.sizes['time']} ({str(prior.time.values[0])[:10]} to {str(prior.time.values[-1])[:10]})")
+    print(
+        f"Common dates: {prior.sizes['time']} "
+        f"({str(prior.time.values[0])[:10]} to {str(prior.time.values[-1])[:10]})"
+    )
 
     fields = {}
+    wlat = xr.DataArray(
+        np.cos(np.deg2rad(np.asarray(prior.lat.values, dtype=float))),
+        dims=("lat",), coords={"lat": prior.lat}, name="area_weight",
+    )
+
     for key in VARS:
-        valid = np.isfinite(prior[key]) & np.isfinite(retr[key])
-        fields[f"p_{key}"] = prior[key].where(valid).mean("time", skipna=True)
-        fields[f"r_{key}"] = retr[key].where(valid).mean("time", skipna=True)
+        p = prior[key]
+        r = retr[key]
+        valid = np.isfinite(p) & np.isfinite(r)
+        fields[f"p_{key}"] = p.where(valid).mean("time", skipna=True)
+        fields[f"r_{key}"] = r.where(valid).mean("time", skipna=True)
         fields[f"n_{key}"] = valid.sum("time")
 
-    allout = xr.Dataset(fields).compute()  # one shared Dask graph
-    means = allout[[v for v in allout.data_vars if not v.startswith("n_")]]
+        w = wlat.broadcast_like(p).where(valid)
+        fields[f"sw_{key}"] = w.sum(("time", "lat", "lon"), skipna=True)
+        fields[f"sp_{key}"] = (p.where(valid) * w).sum(("time", "lat", "lon"), skipna=True)
+        fields[f"sp2_{key}"] = ((p.where(valid) ** 2) * w).sum(("time", "lat", "lon"), skipna=True)
+        fields[f"sr_{key}"] = (r.where(valid) * w).sum(("time", "lat", "lon"), skipna=True)
+        fields[f"sr2_{key}"] = ((r.where(valid) ** 2) * w).sum(("time", "lat", "lon"), skipna=True)
+
+    allout = xr.Dataset(fields).compute()
+    means = allout[[v for v in allout.data_vars if v.startswith(("p_", "r_"))]]
     counts = xr.Dataset({k: allout[f"n_{k}"] for k in VARS})
-    return means, counts
+
+    rows = []
+    for key, meta in VARS.items():
+        _, _, _, long_name, units = meta
+        sw = float(allout[f"sw_{key}"].values)
+        mu_p = float(allout[f"sp_{key}"].values) / sw
+        mu_r = float(allout[f"sr_{key}"].values) / sw
+        e2_p = float(allout[f"sp2_{key}"].values) / sw
+        e2_r = float(allout[f"sr2_{key}"].values) / sw
+        sd_p = np.sqrt(max(e2_p - mu_p * mu_p, 0.0))
+        sd_r = np.sqrt(max(e2_r - mu_r * mu_r, 0.0))
+        rows.append({
+            "key": key,
+            "quantity": long_name,
+            "common_units": units,
+            "paired_cosp_mean": mu_p,
+            "paired_cosp_std": sd_p,
+            "paired_modis_mean": mu_r,
+            "paired_modis_std": sd_r,
+            "paired_mean_delta_modis_minus_cosp": mu_r - mu_p,
+            "paired_mean_shift_in_cosp_sigma": (mu_r - mu_p) / sd_p if sd_p > 0 else np.nan,
+            "paired_std_ratio_modis_over_cosp": sd_r / sd_p if sd_p > 0 else np.nan,
+        })
+
+    return means, counts, pd.DataFrame(rows)
+
+
+def write_domain_shift_stats(paired_stats: pd.DataFrame, outdir: Path, basename: str) -> Path:
+    """Write/print normalization and paired-distribution diagnostics in common units."""
+    norm = _normalization_stats()
+    table = norm.merge(
+        paired_stats.drop(columns=["quantity", "common_units"]),
+        on="key", how="left", validate="one_to_one",
+    )
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    path = outdir / f"{basename}_standardization_domain_shift.csv"
+    table.to_csv(path, index=False, float_format="%.8g")
+
+    show = table[[
+        "key", "common_units",
+        "cosp_norm_mean", "cosp_norm_std",
+        "modis_norm_mean", "modis_norm_std",
+        "norm_mean_shift_in_cosp_sigma", "norm_std_ratio_modis_over_cosp",
+        "paired_cosp_mean", "paired_cosp_std",
+        "paired_modis_mean", "paired_modis_std",
+        "paired_mean_shift_in_cosp_sigma", "paired_std_ratio_modis_over_cosp",
+    ]].copy()
+    print("\nCOSP -> MODIS input-domain statistics (common physical units)")
+    print("Normalization columns reproduce the coordinate transforms seen by the networks.")
+    print(show.to_string(index=False, float_format=lambda x: f"{x:.4g}"))
+    print(f"Saved {path}")
+    return path
 
 
 def awmean(da: xr.DataArray) -> float:
@@ -304,7 +447,10 @@ def plot(means: xr.Dataset, counts: xr.Dataset, mode: str, outdir: Path, basenam
 
         n = np.asarray(counts[key], float)
         n = n[np.isfinite(n) & (n > 0)]
-        print(f"{key:4s}: COSP={g[0]:.3f}, retrieval={g[1]:.3f}, delta={g[2]:+.3f} {dunits}; median paired days={np.nanmedian(n):.0f}")
+        print(
+            f"{key:4s}: COSP={g[0]:.3f}, retrieval={g[1]:.3f}, "
+            f"delta={g[2]:+.3f} {dunits}; median paired days={np.nanmedian(n):.0f}"
+        )
 
     outdir.mkdir(parents=True, exist_ok=True)
     stem = outdir / f"{basename}_{mode}"
@@ -337,7 +483,9 @@ def main():
     p, r = p.sel(time=common), r.sel(time=common)
     p, r = canonical(p, 0), canonical(r, 1)
     p = regrid_prior(p, r)
-    means, counts = paired_means(p, r)
+
+    means, counts, paired_stats = paired_products(p, r)
+    write_domain_shift_stats(paired_stats, a.outdir, a.basename)
     plot(means, counts, a.difference, a.outdir, a.basename)
 
 
