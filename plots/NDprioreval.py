@@ -12,10 +12,11 @@ Columns
 1 : NDinc_cf01p          (reference)
 2 : NDinc_cf01p_pred     (prediction)
 3 : mean percent bias    100 * (mean(pred) - mean(ref)) / mean(ref)
-4 : absolute-unit bias   mean(pred) - mean(ref), in cm^-3
+4 : absolute bias        abs(mean(pred) - mean(ref)), in cm^-3
 
-The first two columns share a logarithmic colorbar. The percent-bias and
-absolute-unit-bias columns use zero-centered diverging scales.
+The first two columns share a logarithmic colorbar. Percent bias uses a
+zero-centered diverging scale. Absolute bias uses a white-to-turbo
+logarithmic scale from 1 to 100 cm^-3.
 
 Edit the GLOBAL CONFIGURATION section for normal use.
 """
@@ -50,7 +51,7 @@ PRED_VAR = "NDinc_cf01p_pred"
 REF_LABEL = "GiOcean"
 PRED_LABEL = "NDnet-prior"
 BIAS_LABEL = "Mean % bias"
-ABS_BIAS_LABEL = r"Bias (cm$^{-3}$)"
+ABS_BIAS_LABEL = r"Absolute bias (cm$^{-3}$)"
 
 OUT_PNG = "NDnetprior_eval.png"
 
@@ -75,12 +76,12 @@ BIAS_MAX = 50.0
 BIAS_TICKS = [-50, -25, 0, 25, 50]
 BIAS_CMAP = "RdBu_r"
 
-# Signed bias in absolute Nd units [cm^-3].  A symmetric-log normalization
-# expands the near-zero structure while retaining the full +/-100 range.
+# Absolute-bias scale [cm^-3].
+ABS_BIAS_MIN = 1.0
 ABS_BIAS_MAX = 100.0
-ABS_BIAS_LINTHRESH = 1.0
-ABS_BIAS_TICKS = [-100, -50, -20, -5, -1, 0, 1, 5, 20, 50, 100]
-ABS_BIAS_CMAP = "RdBu_r"
+ABS_BIAS_TICKS = [1, 2, 5, 10, 20, 50, 100]
+ABS_BIAS_CMAP = "turbo"
+ABS_BIAS_WHITE_FRACTION = 0.22
 
 PRESSURE_TICKS = [1000, 850, 700, 500, 300, 200]
 LON_TICKS = [-120, -60, 0, 60, 120]
@@ -132,6 +133,29 @@ def _plain_number(x, pos=None):
     return f"{x:g}"
 
 
+def _add_white_to_cmap(cmap_name, white_fraction=0.22, n=256):
+    """Blend white progressively into the low end of a named colormap."""
+    if not 0.0 < white_fraction <= 1.0:
+        raise ValueError("white_fraction must be in (0, 1].")
+
+    base = plt.get_cmap(cmap_name)
+    colors = base(np.linspace(0.0, 1.0, n))
+    nblend = max(2, int(round(n * white_fraction)))
+
+    blend = np.linspace(0.0, 1.0, nblend)[:, None]
+    colors[:nblend, :3] = (
+        (1.0 - blend) * np.ones((nblend, 3))
+        + blend * colors[:nblend, :3]
+    )
+
+    cmap = mcolors.ListedColormap(
+        colors,
+        name=f"{cmap_name}_whiteblend",
+    )
+    cmap.set_under("white")
+    return cmap
+
+
 # ============================================================
 # PLOTTING
 # ============================================================
@@ -146,18 +170,19 @@ def plot_comparison(ref, pred, out_png):
 
     denom = avg_ref.where(avg_ref >= BIAS_DENOM_MIN)
     avg_bias = 100.0 * delta / denom
-    avg_abs_bias = delta
+    avg_abs_bias = np.abs(delta)
 
     abs_norm = mcolors.LogNorm(vmin=COLOR_MIN, vmax=COLOR_MAX)
     bias_norm = mcolors.TwoSlopeNorm(
         vmin=-BIAS_MAX, vcenter=0.0, vmax=BIAS_MAX
     )
-    abs_bias_norm = mcolors.SymLogNorm(
-        linthresh=ABS_BIAS_LINTHRESH,
-        linscale=1.0,
-        vmin=-ABS_BIAS_MAX,
+    abs_bias_norm = mcolors.LogNorm(
+        vmin=ABS_BIAS_MIN,
         vmax=ABS_BIAS_MAX,
-        base=10,
+    )
+    abs_bias_cmap = _add_white_to_cmap(
+        ABS_BIAS_CMAP,
+        white_fraction=ABS_BIAS_WHITE_FRACTION,
     )
 
     proj = ccrs.PlateCarree()
@@ -213,17 +238,23 @@ def plot_comparison(ref, pred, out_png):
             (bias_slice.transpose(LAT_DIM, LON_DIM), bias_level,
              BIAS_CMAP, bias_norm, "bias"),
             (abs_bias_slice.transpose(LAT_DIM, LON_DIM), abs_bias_level,
-             ABS_BIAS_CMAP, abs_bias_norm, "abs_bias"),
+             abs_bias_cmap, abs_bias_norm, "abs_bias"),
         ]
 
         for col, (field, actual_level, cmap, norm, kind) in enumerate(panels):
             ax = axes[row, col]
             letter = panel_letters[row * 4 + col]
 
+            plot_field = field
+            if kind == "abs_bias":
+                # Preserve the true field for statistics, but place values
+                # below the plotted logarithmic minimum at the white end.
+                plot_field = field.clip(min=ABS_BIAS_MIN)
+
             ax.pcolormesh(
-                field[LON_DIM].values,
-                field[LAT_DIM].values,
-                field.values,
+                plot_field[LON_DIM].values,
+                plot_field[LAT_DIM].values,
+                plot_field.values,
                 transform=proj,
                 shading="auto",
                 cmap=cmap,
@@ -253,7 +284,7 @@ def plot_comparison(ref, pred, out_png):
             if kind == "bias":
                 right_title = rf"$\langle bias\rangle$ = {gmean:.1f}%"
             elif kind == "abs_bias":
-                right_title = rf"$\langle \Delta N_d\rangle$ = {gmean:.1f}"
+                right_title = rf"$\langle |\Delta N_d|\rangle$ = {gmean:.1f}"
             else:
                 right_title = rf"$\langle N_d\rangle$ = {gmean:.1f}"
 
@@ -266,19 +297,19 @@ def plot_comparison(ref, pred, out_png):
     zonal_pred = avg_pred.mean(dim=LON_DIM, skipna=True)
     zonal_denom = zonal_ref.where(zonal_ref >= BIAS_DENOM_MIN)
     zonal_bias = 100.0 * (zonal_pred - zonal_ref) / zonal_denom
-    zonal_abs_bias = zonal_pred - zonal_ref
+    zonal_abs_bias = np.abs(zonal_pred - zonal_ref)
 
     zonal_fields = [
-        (zonal_ref, ABS_CMAP, abs_norm),
-        (zonal_pred, ABS_CMAP, abs_norm),
-        (zonal_bias, BIAS_CMAP, bias_norm),
-        (zonal_abs_bias, ABS_BIAS_CMAP, abs_bias_norm),
+        (zonal_ref, ABS_CMAP, abs_norm, "field"),
+        (zonal_pred, ABS_CMAP, abs_norm, "field"),
+        (zonal_bias, BIAS_CMAP, bias_norm, "bias"),
+        (zonal_abs_bias, abs_bias_cmap, abs_bias_norm, "abs_bias"),
     ]
 
     p_top = min(PRESSURE_TICKS)
     p_bottom = max(PRESSURE_TICKS)
 
-    for col, (zonal, cmap, norm) in enumerate(zonal_fields):
+    for col, (zonal, cmap, norm, kind) in enumerate(zonal_fields):
         ax = axes[3, col]
         letter = panel_letters[12 + col]
         zonal = zonal.transpose(LEV_DIM, LAT_DIM)
@@ -290,7 +321,18 @@ def plot_comparison(ref, pred, out_png):
         lev = np.asarray(zonal[LEV_DIM].values, dtype=float)
         lat = np.asarray(zonal[LAT_DIM].values, dtype=float)
 
-        ax.pcolormesh(lat, lev, zonal.values, shading="auto", cmap=cmap, norm=norm)
+        plot_zonal = zonal
+        if kind == "abs_bias":
+            plot_zonal = zonal.clip(min=ABS_BIAS_MIN)
+
+        ax.pcolormesh(
+            lat,
+            lev,
+            plot_zonal.values,
+            shading="auto",
+            cmap=cmap,
+            norm=norm,
+        )
         ax.set_yscale("linear")
         ax.set_ylim(p_bottom, p_top)
         ax.set_yticks(PRESSURE_TICKS)
@@ -308,7 +350,6 @@ def plot_comparison(ref, pred, out_png):
         else:
             ax.set_ylabel("")
 
-        # Center the common x label across the four-column zonal row.
         ax.set_xlabel("Latitude (deg)" if col == 1 else "", fontsize=8.5, labelpad=2)
         ax.set_title(f"({letter})  Zonal mean", loc="left", fontsize=9.5, pad=3)
 
@@ -334,7 +375,7 @@ def plot_comparison(ref, pred, out_png):
     cbar_bias.set_label("Mean bias (%)", fontsize=9, labelpad=3)
     cbar_bias.ax.tick_params(labelsize=7, length=2.5, width=0.6, pad=2)
 
-    sm_abs_bias = plt.cm.ScalarMappable(norm=abs_bias_norm, cmap=ABS_BIAS_CMAP)
+    sm_abs_bias = plt.cm.ScalarMappable(norm=abs_bias_norm, cmap=abs_bias_cmap)
     sm_abs_bias.set_array([])
     cax_abs_bias = fig.add_axes([0.775, 0.055, 0.185, 0.018])
     cbar_abs_bias = fig.colorbar(
@@ -342,7 +383,11 @@ def plot_comparison(ref, pred, out_png):
     )
     cbar_abs_bias.set_ticks(ABS_BIAS_TICKS)
     cbar_abs_bias.ax.xaxis.set_major_formatter(FuncFormatter(_plain_number))
-    cbar_abs_bias.set_label(rf"Bias ({FIELD_UNITS})", fontsize=9, labelpad=3)
+    cbar_abs_bias.set_label(
+        rf"Absolute bias ({FIELD_UNITS})",
+        fontsize=9,
+        labelpad=3,
+    )
     cbar_abs_bias.ax.tick_params(labelsize=7, length=2.5, width=0.6, pad=2)
 
     fig.savefig(out_png, dpi=DPI, bbox_inches="tight")
