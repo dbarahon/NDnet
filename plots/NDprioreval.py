@@ -12,10 +12,10 @@ Columns
 1 : NDinc_cf01p          (reference)
 2 : NDinc_cf01p_pred     (prediction)
 3 : mean percent bias    100 * (mean(pred) - mean(ref)) / mean(ref)
-4 : absolute error       abs(mean(pred) - mean(ref))
+4 : absolute-unit bias   mean(pred) - mean(ref), in cm^-3
 
-The first two columns share a logarithmic colorbar. Bias uses a
-zero-centered diverging scale, and absolute error uses a sequential scale.
+The first two columns share a logarithmic colorbar. The percent-bias and
+absolute-unit-bias columns use zero-centered diverging scales.
 
 Edit the GLOBAL CONFIGURATION section for normal use.
 """
@@ -50,7 +50,7 @@ PRED_VAR = "NDinc_cf01p_pred"
 REF_LABEL = "GiOcean"
 PRED_LABEL = "NDnet-prior"
 BIAS_LABEL = "Mean % bias"
-ERROR_LABEL = "Absolute error"
+ABS_BIAS_LABEL = r"Bias (cm$^{-3}$)"
 
 OUT_PNG = "NDnetprior_eval.png"
 
@@ -75,10 +75,12 @@ BIAS_MAX = 50.0
 BIAS_TICKS = [-50, -25, 0, 25, 50]
 BIAS_CMAP = "RdBu_r"
 
-# Absolute-error scale [cm^-3].
-ERROR_MAX = 300.0
-ERROR_TICKS = [0, 50, 100, 150, 200, 250, 300]
-ERROR_CMAP = "magma"
+# Signed bias in absolute Nd units [cm^-3].  A symmetric-log normalization
+# expands the near-zero structure while retaining the full +/-100 range.
+ABS_BIAS_MAX = 100.0
+ABS_BIAS_LINTHRESH = 1.0
+ABS_BIAS_TICKS = [-100, -50, -20, -5, -1, 0, 1, 5, 20, 50, 100]
+ABS_BIAS_CMAP = "RdBu_r"
 
 PRESSURE_TICKS = [1000, 850, 700, 500, 300, 200]
 LON_TICKS = [-120, -60, 0, 60, 120]
@@ -144,13 +146,19 @@ def plot_comparison(ref, pred, out_png):
 
     denom = avg_ref.where(avg_ref >= BIAS_DENOM_MIN)
     avg_bias = 100.0 * delta / denom
-    avg_error = np.abs(delta)
+    avg_abs_bias = delta
 
     abs_norm = mcolors.LogNorm(vmin=COLOR_MIN, vmax=COLOR_MAX)
     bias_norm = mcolors.TwoSlopeNorm(
         vmin=-BIAS_MAX, vcenter=0.0, vmax=BIAS_MAX
     )
-    error_norm = mcolors.Normalize(vmin=0.0, vmax=ERROR_MAX)
+    abs_bias_norm = mcolors.SymLogNorm(
+        linthresh=ABS_BIAS_LINTHRESH,
+        linscale=1.0,
+        vmin=-ABS_BIAS_MAX,
+        vmax=ABS_BIAS_MAX,
+        base=10,
+    )
 
     proj = ccrs.PlateCarree()
     fig = plt.figure(figsize=(15.6, 8.2))
@@ -176,7 +184,7 @@ def plot_comparison(ref, pred, out_png):
         axes[3, col] = fig.add_subplot(gs[3, col])
 
     panel_letters = list(string.ascii_lowercase[:16])
-    column_headers = [REF_LABEL, PRED_LABEL, BIAS_LABEL, ERROR_LABEL]
+    column_headers = [REF_LABEL, PRED_LABEL, BIAS_LABEL, ABS_BIAS_LABEL]
 
     for col, title in enumerate(column_headers):
         axes[0, col].text(
@@ -193,7 +201,9 @@ def plot_comparison(ref, pred, out_png):
         ref_slice, ref_level = _nearest_level_slice(avg_ref, requested_level)
         pred_slice, pred_level = _nearest_level_slice(avg_pred, requested_level)
         bias_slice, bias_level = _nearest_level_slice(avg_bias, requested_level)
-        err_slice, err_level = _nearest_level_slice(avg_error, requested_level)
+        abs_bias_slice, abs_bias_level = _nearest_level_slice(
+            avg_abs_bias, requested_level
+        )
 
         panels = [
             (ref_slice.transpose(LAT_DIM, LON_DIM), ref_level,
@@ -202,8 +212,8 @@ def plot_comparison(ref, pred, out_png):
              ABS_CMAP, abs_norm, "field"),
             (bias_slice.transpose(LAT_DIM, LON_DIM), bias_level,
              BIAS_CMAP, bias_norm, "bias"),
-            (err_slice.transpose(LAT_DIM, LON_DIM), err_level,
-             ERROR_CMAP, error_norm, "error"),
+            (abs_bias_slice.transpose(LAT_DIM, LON_DIM), abs_bias_level,
+             ABS_BIAS_CMAP, abs_bias_norm, "abs_bias"),
         ]
 
         for col, (field, actual_level, cmap, norm, kind) in enumerate(panels):
@@ -242,8 +252,8 @@ def plot_comparison(ref, pred, out_png):
             gmean = _lat_weighted_global_mean(field)
             if kind == "bias":
                 right_title = rf"$\langle bias\rangle$ = {gmean:.1f}%"
-            elif kind == "error":
-                right_title = rf"$\langle |\Delta N_d|\rangle$ = {gmean:.1f}"
+            elif kind == "abs_bias":
+                right_title = rf"$\langle \Delta N_d\rangle$ = {gmean:.1f}"
             else:
                 right_title = rf"$\langle N_d\rangle$ = {gmean:.1f}"
 
@@ -256,13 +266,13 @@ def plot_comparison(ref, pred, out_png):
     zonal_pred = avg_pred.mean(dim=LON_DIM, skipna=True)
     zonal_denom = zonal_ref.where(zonal_ref >= BIAS_DENOM_MIN)
     zonal_bias = 100.0 * (zonal_pred - zonal_ref) / zonal_denom
-    zonal_error = np.abs(zonal_pred - zonal_ref)
+    zonal_abs_bias = zonal_pred - zonal_ref
 
     zonal_fields = [
         (zonal_ref, ABS_CMAP, abs_norm),
         (zonal_pred, ABS_CMAP, abs_norm),
         (zonal_bias, BIAS_CMAP, bias_norm),
-        (zonal_error, ERROR_CMAP, error_norm),
+        (zonal_abs_bias, ABS_BIAS_CMAP, abs_bias_norm),
     ]
 
     p_top = min(PRESSURE_TICKS)
@@ -324,14 +334,16 @@ def plot_comparison(ref, pred, out_png):
     cbar_bias.set_label("Mean bias (%)", fontsize=9, labelpad=3)
     cbar_bias.ax.tick_params(labelsize=7, length=2.5, width=0.6, pad=2)
 
-    sm_error = plt.cm.ScalarMappable(norm=error_norm, cmap=ERROR_CMAP)
-    sm_error.set_array([])
-    cax_error = fig.add_axes([0.775, 0.055, 0.185, 0.018])
-    cbar_error = fig.colorbar(sm_error, cax=cax_error, orientation="horizontal")
-    cbar_error.set_ticks([t for t in ERROR_TICKS if 0 <= t <= ERROR_MAX])
-    cbar_error.ax.xaxis.set_major_formatter(FuncFormatter(_plain_number))
-    cbar_error.set_label(rf"Absolute error ({FIELD_UNITS})", fontsize=9, labelpad=3)
-    cbar_error.ax.tick_params(labelsize=7, length=2.5, width=0.6, pad=2)
+    sm_abs_bias = plt.cm.ScalarMappable(norm=abs_bias_norm, cmap=ABS_BIAS_CMAP)
+    sm_abs_bias.set_array([])
+    cax_abs_bias = fig.add_axes([0.775, 0.055, 0.185, 0.018])
+    cbar_abs_bias = fig.colorbar(
+        sm_abs_bias, cax=cax_abs_bias, orientation="horizontal"
+    )
+    cbar_abs_bias.set_ticks(ABS_BIAS_TICKS)
+    cbar_abs_bias.ax.xaxis.set_major_formatter(FuncFormatter(_plain_number))
+    cbar_abs_bias.set_label(rf"Bias ({FIELD_UNITS})", fontsize=9, labelpad=3)
+    cbar_abs_bias.ax.tick_params(labelsize=7, length=2.5, width=0.6, pad=2)
 
     fig.savefig(out_png, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
