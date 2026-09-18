@@ -5,9 +5,9 @@ The JSONL file is expected to contain one object per line with, at minimum,
 site, lat and lon fields. The default map is restricted to 30 W--70 E because
 the network is concentrated in Europe and the eastern Atlantic; sites outside
 that longitude range are omitted and reported on stdout. Each retained site is
-assigned a stable alphabetical letter ID after exclusions and domain filtering.
-The map shows a colored marker and matching colored letter for each site; full
-site names are kept in an external legend to avoid crowding the map.
+assigned a distinct marker/color combination after exclusions and domain
+filtering. The map shows only the site markers; site names are kept in an
+external legend using the same marker and color to avoid crowding the map.
 
 Examples
 --------
@@ -33,7 +33,6 @@ import numpy as np
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import matplotlib.patheffects as path_effects
 from matplotlib.lines import Line2D
 
 import cartopy.crs as ccrs
@@ -242,7 +241,6 @@ def assign_site_styles(sites):
     styled = []
     for index, (site, color) in enumerate(zip(sites, colors)):
         item = dict(site)
-        item["letter"] = panel_letter(index)
         item["color"] = color
         item["marker"] = MARKERS[index % len(MARKERS)]
         styled.append(item)
@@ -297,26 +295,6 @@ def plot_sites(sites, output, dpi=DPI):
             zorder=5,
         )
 
-        # Keep the map uncluttered by drawing only compact letter IDs on-map.
-        # A white halo preserves legibility over coastlines and neighboring sites.
-        txt = ax.annotate(
-            site["letter"],
-            xy=(site["lon"], site["lat"]),
-            xycoords="data",
-            xytext=(3.2, 3.2),
-            textcoords="offset points",
-            ha="left",
-            va="bottom",
-            fontsize=6.5,
-            fontweight="bold",
-            color=site["color"],
-            clip_on=True,
-            zorder=6,
-        )
-        txt.set_path_effects(
-            [path_effects.withStroke(linewidth=1.5, foreground="white")]
-        )
-
         legend_handles.append(
             Line2D(
                 [0],
@@ -328,7 +306,7 @@ def plot_sites(sites, output, dpi=DPI):
                 markeredgecolor=site["color"],
                 markeredgewidth=0.6,
                 color=site["color"],
-                label=f"{site['letter']}  {display_name(site['site'])}",
+                label=display_name(site["site"]),
             )
         )
 
