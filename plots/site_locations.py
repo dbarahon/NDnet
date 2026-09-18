@@ -2,10 +2,12 @@
 """Plot Cloudnet ground-site locations from the NDnet site diagnostics JSONL.
 
 The JSONL file is expected to contain one object per line with, at minimum,
-site, lat and lon fields. Each retained site is assigned a stable alphabetical
-letter ID after exclusions are applied. The map shows a colored marker and
-matching colored letter for each site; full site names are kept in an external
-legend to avoid crowding the map.
+site, lat and lon fields. The default map is restricted to 30 W--70 E because
+the network is concentrated in Europe and the eastern Atlantic; sites outside
+that longitude range are omitted and reported on stdout. Each retained site is
+assigned a stable alphabetical letter ID after exclusions and domain filtering.
+The map shows a colored marker and matching colored letter for each site; full
+site names are kept in an external legend to avoid crowding the map.
 
 Examples
 --------
@@ -53,10 +55,18 @@ DEFAULT_OUTPUT = "Cloudnet_site_locations.pdf"
 # are added to this tuple rather than replacing it. Matching is case-insensitive.
 EXCLUDE_SITES = ()
 
-FIGSIZE = (7.2, 3.4)
+FIGSIZE = (7.2, 5.0)
 DPI = 400
 
-LON_TICKS = [-180, -120, -60, 0, 60, 120, 180]
+# The site network is concentrated in Europe and the eastern Atlantic.
+# Restricting the longitude range makes individual sites identifiable while
+# retaining the full meridional range of the network.
+DOMAIN_LON_MIN = -30.0
+DOMAIN_LON_MAX = 70.0
+DOMAIN_LAT_MIN = -80.0
+DOMAIN_LAT_MAX = 85.0
+
+LON_TICKS = [-30, -10, 10, 30, 50, 70]
 LAT_TICKS = [-60, -30, 0, 30, 60]
 
 MARKERS = ("o", "s", "^", "D", "v", "P", "X", "h", "<", ">", "p", "*")
@@ -201,6 +211,27 @@ def apply_exclusions(sites, exclusions):
     return selected
 
 
+def apply_domain_filter(sites):
+    """Keep sites within the plotted longitude window.
+
+    Sites outside 30 W--70 E are omitted from both the map and legend and are
+    returned separately so the script reports them explicitly for the caption.
+    """
+    selected = []
+    omitted = []
+
+    for site in sites:
+        if DOMAIN_LON_MIN <= site["lon"] <= DOMAIN_LON_MAX:
+            selected.append(site)
+        else:
+            omitted.append(site)
+
+    if not selected:
+        raise ValueError("No sites fall within the configured map domain.")
+
+    return selected, omitted
+
+
 def assign_site_styles(sites):
     """Assign letter, color and marker identifiers to sites."""
     nsite = len(sites)
@@ -231,9 +262,12 @@ def plot_sites(sites, output, dpi=DPI):
     ax = fig.add_subplot(1, 1, 1, projection=proj)
 
     # Reserve the right portion of the figure for the external legend.
-    fig.subplots_adjust(left=0.065, right=0.64, bottom=0.13, top=0.97)
+    fig.subplots_adjust(left=0.075, right=0.64, bottom=0.10, top=0.98)
 
-    ax.set_global()
+    ax.set_extent(
+        [DOMAIN_LON_MIN, DOMAIN_LON_MAX, DOMAIN_LAT_MIN, DOMAIN_LAT_MAX],
+        crs=proj,
+    )
     ax.add_feature(cfeature.LAND, facecolor="0.94", edgecolor="none", zorder=0)
     ax.add_feature(cfeature.OCEAN, facecolor="white", edgecolor="none", zorder=0)
     ax.add_feature(cfeature.LAKES, facecolor="white", edgecolor="0.70", linewidth=0.25)
@@ -257,8 +291,8 @@ def plot_sites(sites, output, dpi=DPI):
             marker=site["marker"],
             markersize=5.2,
             markerfacecolor=site["color"],
-            markeredgecolor="black",
-            markeredgewidth=0.35,
+            markeredgecolor=site["color"],
+            markeredgewidth=0.6,
             transform=proj,
             zorder=5,
         )
@@ -291,8 +325,8 @@ def plot_sites(sites, output, dpi=DPI):
                 marker=site["marker"],
                 markersize=4.8,
                 markerfacecolor=site["color"],
-                markeredgecolor="black",
-                markeredgewidth=0.35,
+                markeredgecolor=site["color"],
+                markeredgewidth=0.6,
                 color=site["color"],
                 label=f"{site['letter']}  {display_name(site['site'])}",
             )
@@ -369,11 +403,18 @@ def main():
     sites = read_sites(args.input)
     exclusions = list(EXCLUDE_SITES) + list(args.exclude_site)
     sites = apply_exclusions(sites, exclusions)
+    sites, domain_omitted = apply_domain_filter(sites)
     sites = assign_site_styles(sites)
 
     print(f"Sites plotted: {len(sites)}")
     if exclusions:
         print("Exclusions requested: " + ", ".join(exclusions))
+    if domain_omitted:
+        print(
+            "Outside plotted longitude range "
+            f"({abs(DOMAIN_LON_MIN):g} W--{DOMAIN_LON_MAX:g} E): "
+            + ", ".join(site["site"] for site in domain_omitted)
+        )
 
     plot_sites(sites, args.output, dpi=args.dpi)
 
