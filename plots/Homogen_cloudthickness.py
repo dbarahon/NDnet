@@ -319,32 +319,58 @@ def _time_index_for_day(nc, day):
     )
 
 
-def _read_modis_ctp(day, expected_lat, expected_lon):
+def _open_modis_month(day, expected_lat, expected_lon):
+    """Open one MODIS monthly file and validate its grid once."""
     path = _modis_month_file(day)
-    with Dataset(_quiet_path(path), "r") as nc:
-        it = _time_index_for_day(nc, day)
-        ctp = _read_2d_time_slice(nc, MODIS_VAR, it)
+    nc = Dataset(_quiet_path(path), "r")
 
+    try:
         lat = np.asarray(nc.variables[LAT_DIM][:], dtype=np.float64)
         lon = np.asarray(nc.variables[LON_DIM][:], dtype=np.float64)
 
-    if ctp.shape != (len(expected_lat), len(expected_lon)):
+        if lat.shape != np.shape(expected_lat) or not np.allclose(
+            lat, expected_lat, rtol=0.0, atol=1.0e-6
+        ):
+            raise ValueError(
+                f"MODIS and NDnet latitude coordinates differ in {path}"
+            )
+
+        if lon.shape != np.shape(expected_lon) or not np.allclose(
+            lon, expected_lon, rtol=0.0, atol=1.0e-6
+        ):
+            raise ValueError(
+                f"MODIS and NDnet longitude coordinates differ in {path}"
+            )
+
+        return nc
+    except Exception:
+        nc.close()
+        raise
+
+
+def _read_modis_ctp_from_open(nc, day, expected_shape):
+    """Read one daily CTP field from an already-open monthly MODIS file."""
+    it = _time_index_for_day(nc, day)
+    ctp = _read_2d_time_slice(nc, MODIS_VAR, it)
+
+    if ctp.shape != expected_shape:
         raise ValueError(
             f"MODIS {MODIS_VAR} shape {ctp.shape} does not match "
-            f"NDnet grid {(len(expected_lat), len(expected_lon))} in {path}"
+            f"NDnet grid {expected_shape} in {nc.filepath()}"
         )
 
-    if lat.shape != np.shape(expected_lat) or not np.allclose(
-        lat, expected_lat, rtol=0.0, atol=1.0e-6
-    ):
-        raise ValueError(f"MODIS and NDnet latitude coordinates differ in {path}")
-
-    if lon.shape != np.shape(expected_lon) or not np.allclose(
-        lon, expected_lon, rtol=0.0, atol=1.0e-6
-    ):
-        raise ValueError(f"MODIS and NDnet longitude coordinates differ in {path}")
-
     return _normalize_modis_ctp_hpa(ctp)
+
+
+def _read_modis_ctp(day, expected_lat, expected_lon):
+    """Convenience one-shot reader; year processing keeps each month open."""
+    nc = _open_modis_month(day, expected_lat, expected_lon)
+    try:
+        return _read_modis_ctp_from_open(
+            nc, day, (len(expected_lat), len(expected_lon))
+        )
+    finally:
+        nc.close()
 
 
 # ============================================================
@@ -735,6 +761,9 @@ def _process_one_year(year, files, nd_threshold, h_threshold):
         tmp_path, year, lat, lon, nd_threshold, h_threshold
     )
 
+    modis_nc = None
+    modis_ym = None
+
     try:
         for it, infile in enumerate(files):
             day = _date_from_filename(infile)
@@ -754,7 +783,17 @@ def _process_one_year(year, files, nd_threshold, h_threshold):
             ptop_nd, pbottom = _cloud_bounds_from_nd(
                 nd, p_hpa, nd_threshold
             )
-            ptop_modis = _read_modis_ctp(day, lat, lon)
+
+            ym = day.strftime("%Y%m")
+            if ym != modis_ym:
+                if modis_nc is not None:
+                    modis_nc.close()
+                modis_nc = _open_modis_month(day, lat, lon)
+                modis_ym = ym
+
+            ptop_modis = _read_modis_ctp_from_open(
+                modis_nc, day, (len(lat), len(lon))
+            )
 
             H_nd, R_nd = _compute_variable_bound_H_R(
                 nd, sigma, p_hpa, ptop_nd, pbottom, nd_threshold
@@ -775,6 +814,8 @@ def _process_one_year(year, files, nd_threshold, h_threshold):
 
         out.sync()
     finally:
+        if modis_nc is not None:
+            modis_nc.close()
         out.close()
 
     os.replace(tmp_path, out_path)
@@ -964,7 +1005,7 @@ def plot_climatology(h_threshold, out_png=OUT_PNG):
 
     column_titles = [
         r"Median $H$",
-        rf"Days with $H>{100.0*h_threshold:g}\\%$",
+        rf"Days with $H>{100.0*h_threshold:g}$%",
         r"Median $R$",
     ]
     right_formats = [
