@@ -1097,8 +1097,8 @@ def plot_climatology(h_threshold, out_png=OUT_PNG):
 
     cbar_ticks = [H_CBAR_TICKS, FREQ_CBAR_TICKS, R_CBAR_TICKS]
     cbar_labels = [
-        r"$H$ ($\%$)",
-        rf"Valid days with $H>{h_threshold:g}$ ($\%$)",
+        r"$H$ (%)",
+        rf"Valid days with $H>{100.0*h_threshold:g}$% (%)",
         r"$R$",
     ]
 
