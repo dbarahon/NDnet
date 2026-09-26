@@ -8,7 +8,8 @@ and use two alternative cloud-top pressures:
     row 1: Ptop = uppermost pressure level with Nd > ND_THRESHOLD_CM3
     row 2: Ptop = MODIS Cloud_Top_Pressure_Mean
 
-Within [Ptop, Pbottom], all moments are integrated in ln(p):
+Within [Ptop, Pbottom], all moments are integrated in ln(p), requiring at
+least three pressure nodes per integral:
     <Nd> = integral Nd dlnp / Delta lnp
     V = integral (Nd - <Nd>)^2 dlnp / Delta lnp
     H = sqrt(V) / <Nd>
@@ -93,6 +94,7 @@ ND_THRESHOLD_CM3 = 1.0
 MIN_LAYER_MEAN_ND = 1.0
 MIN_SIGMA_RMS = 1.0e-6
 H_THRESHOLD = 0.30
+MIN_INTEGRATION_LEVELS = 3
 
 ANNUAL_OUT_DIR = "H_cloudthickness_annual"
 ANNUAL_PREFIX = "Nd_cloudthickness_HR"
@@ -136,7 +138,7 @@ TOP_METHOD_LABELS = (
     r"$P_{\rm top}$ from MODIS",
 )
 
-ALGORITHM_VERSION = 1
+ALGORITHM_VERSION = 2
 
 
 # ============================================================
@@ -403,7 +405,8 @@ def _compute_variable_bound_H_R(
 
     Boundary values are linearly interpolated in ln(p). Interior model levels
     are included exactly. The calculation is strict inside the selected cloud
-    layer: all integration nodes must have finite Nd > threshold; R additionally
+    layer: at least MIN_INTEGRATION_LEVELS pressure nodes are required, all
+    integration nodes must have finite Nd > threshold, and R additionally
     requires finite nonnegative sigmaNd.
     """
     p = np.asarray(p_hpa, dtype=np.float64)
@@ -455,7 +458,10 @@ def _compute_variable_bound_H_R(
 
         interior_idx = np.where((p > pt) & (p < pb))[0]
         pnodes = np.concatenate(([pt], p[interior_idx], [pb]))
-        if pnodes.size < 2 or not np.all(np.diff(pnodes) > 0.0):
+        if (
+            pnodes.size < MIN_INTEGRATION_LEVELS
+            or not np.all(np.diff(pnodes) > 0.0)
+        ):
             continue
 
         ndnodes = np.empty(pnodes.size, dtype=np.float64)
@@ -584,6 +590,7 @@ def _create_annual_output(path, year, lat, lon, nd_threshold, h_threshold):
     nc.setncattr("nd_threshold_cm-3", float(nd_threshold))
     nc.setncattr("h_exceedance_threshold", float(h_threshold))
     nc.setncattr("minimum_layer_mean_Nd_cm-3", float(MIN_LAYER_MEAN_ND))
+    nc.setncattr("minimum_integration_levels", int(MIN_INTEGRATION_LEVELS))
     nc.setncattr("modis_variable", MODIS_VAR)
     nc.setncattr("modis_source", MODIS_SOURCE)
     nc.setncattr("algorithm_version", int(ALGORITHM_VERSION))
@@ -599,6 +606,8 @@ def _annual_file_is_current(path, nd_threshold, h_threshold):
             if "H" not in nc.variables or "R" not in nc.variables:
                 return False
             if int(getattr(nc, "algorithm_version", -1)) != ALGORITHM_VERSION:
+                return False
+            if int(getattr(nc, "minimum_integration_levels", -1)) != MIN_INTEGRATION_LEVELS:
                 return False
             if not np.isclose(
                 float(getattr(nc, "nd_threshold_cm-3", np.nan)),
@@ -692,7 +701,8 @@ def compute_all_years(nd_threshold, h_threshold, workers=N_WORKERS):
     print(f"Found {len(files)} NDnet daily files spanning {len(grouped)} years.")
     print(
         f"Pbottom/Ptop(Nd): Nd > {nd_threshold:g} cm^-3; "
-        f"H exceedance threshold={h_threshold:g} ({100*h_threshold:g}%)."
+        f"H exceedance threshold={h_threshold:g} ({100*h_threshold:g}%); "
+        f"minimum integration levels={MIN_INTEGRATION_LEVELS}."
     )
 
     years = sorted(grouped)
