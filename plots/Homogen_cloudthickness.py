@@ -375,23 +375,6 @@ def _cloud_bounds_from_nd(nd, p_hpa, nd_threshold):
     return ptop, pbottom
 
 
-def _interp_column_logp(field, p_sorted, target_p, jlo, jhi):
-    x = np.log(p_sorted)
-    xt = np.log(target_p)
-    xlo = x[jlo]
-    xhi = x[jhi]
-    a = np.zeros_like(xt, dtype=np.float64)
-    interior = jhi != jlo
-    a[interior] = (
-        (xt[interior] - xlo[interior])
-        / (xhi[interior] - xlo[interior])
-    )
-    return (
-        (1.0 - a) * field[jlo, np.arange(field.shape[1])]
-        + a * field[jhi, np.arange(field.shape[1])]
-    )
-
-
 def _compute_variable_bound_H_R(
     nd,
     sigma,
@@ -401,24 +384,36 @@ def _compute_variable_bound_H_R(
     nd_threshold,
 ):
     """
-    Compute H and R for per-column [Ptop, Pbottom].
+    Vectorized H and R for per-column [Ptop, Pbottom].
 
-    Boundary values are linearly interpolated in ln(p). Interior model levels
-    are included exactly. The calculation is strict inside the selected cloud
-    layer: at least MIN_INTEGRATION_LEVELS pressure nodes are required, all
-    integration nodes must have finite Nd > threshold, and R additionally
-    requires finite nonnegative sigmaNd.
+    This is mathematically equivalent to constructing the pressure nodes
+    [Ptop, interior model levels, Pbottom] separately for every grid column,
+    but avoids the extremely expensive Python loop over columns.
+
+    Boundary Nd and sigmaNd are linearly interpolated in ln(p). Trapezoidal
+    moments are then assembled from:
+      1) the partial top segment,
+      2) cumulative full model-level segments, and
+      3) the partial bottom segment.
+
+    At least MIN_INTEGRATION_LEVELS pressure nodes are required. All selected
+    Nd nodes must be finite and > nd_threshold. R additionally requires finite
+    nonnegative sigmaNd at the same nodes.
     """
     p = np.asarray(p_hpa, dtype=np.float64)
     order = np.argsort(p)
     p = p[order]
+    x = np.log(p)
+
     nd = np.asarray(nd, dtype=np.float64)[order]
     sigma = np.asarray(sigma, dtype=np.float64)[order]
 
     nz, ny, nx = nd.shape
     ncol = ny * nx
-    nd2 = nd.reshape(nz, ncol)
-    sig2 = sigma.reshape(nz, ncol)
+    cols = np.arange(ncol)
+
+    nd2d = nd.reshape(nz, ncol)
+    sig2d = sigma.reshape(nz, ncol)
     top = np.asarray(ptop, dtype=np.float64).reshape(ncol)
     bottom = np.asarray(pbottom, dtype=np.float64).reshape(ncol)
 
@@ -432,82 +427,174 @@ def _compute_variable_bound_H_R(
         & (top >= p[0])
         & (bottom <= p[-1])
     )
-    cols = np.where(base_valid)[0]
-    if cols.size == 0:
+    if not np.any(base_valid):
         return H.reshape(ny, nx), R.reshape(ny, nx)
 
-    for c in cols:
-        pt = top[c]
-        pb = bottom[c]
+    # Safe placeholders keep all vectorized index operations in bounds.
+    top_safe = np.where(base_valid, top, p[0])
+    bottom_safe = np.where(base_valid, bottom, p[-1])
+    x_top = np.log(top_safe)
+    x_bottom = np.log(bottom_safe)
 
-        it_hi = int(np.searchsorted(p, pt, side="left"))
-        if it_hi < len(p) and np.isclose(p[it_hi], pt, rtol=0.0, atol=1.0e-8):
-            it_lo = it_hi
-        else:
-            if it_hi == 0 or it_hi == len(p):
-                continue
-            it_lo = it_hi - 1
+    def _interp_at(field, target, x_target):
+        lo = np.searchsorted(p, target, side="right") - 1
+        lo = np.clip(lo, 0, nz - 2)
+        hi = lo + 1
+        alpha = (x_target - x[lo]) / (x[hi] - x[lo])
+        value = (
+            (1.0 - alpha) * field[lo, cols]
+            + alpha * field[hi, cols]
+        )
+        return value
 
-        ib_hi = int(np.searchsorted(p, pb, side="left"))
-        if ib_hi < len(p) and np.isclose(p[ib_hi], pb, rtol=0.0, atol=1.0e-8):
-            ib_lo = ib_hi
-        else:
-            if ib_hi == 0 or ib_hi == len(p):
-                continue
-            ib_lo = ib_hi - 1
+    nd_top = _interp_at(nd2d, top_safe, x_top)
+    nd_bottom = _interp_at(nd2d, bottom_safe, x_bottom)
+    sig_top = _interp_at(sig2d, top_safe, x_top)
+    sig_bottom = _interp_at(sig2d, bottom_safe, x_bottom)
 
-        interior_idx = np.where((p > pt) & (p < pb))[0]
-        pnodes = np.concatenate(([pt], p[interior_idx], [pb]))
-        if (
-            pnodes.size < MIN_INTEGRATION_LEVELS
-            or not np.all(np.diff(pnodes) > 0.0)
-        ):
-            continue
+    # Strictly interior model levels. The conceptual integration nodes are:
+    # [Ptop, p[i0], ..., p[i1-1], Pbottom].
+    i0 = np.searchsorted(p, top_safe, side="right")
+    i1 = np.searchsorted(p, bottom_safe, side="left")
+    n_nodes = 2 + (i1 - i0)
 
-        ndnodes = np.empty(pnodes.size, dtype=np.float64)
-        signodes = np.empty(pnodes.size, dtype=np.float64)
+    structural_valid = (
+        base_valid
+        & (n_nodes >= MIN_INTEGRATION_LEVELS)
+        & (i0 < i1)
+        & (i0 < nz)
+        & (i1 > 0)
+    )
 
-        def boundary_value(field2, target, jlo, jhi):
-            if jlo == jhi:
-                return field2[jlo, c]
-            x0, x1 = np.log(p[jlo]), np.log(p[jhi])
-            a = (np.log(target) - x0) / (x1 - x0)
-            return (1.0 - a) * field2[jlo, c] + a * field2[jhi, c]
+    # Safe gather indices for columns later masked as invalid.
+    i0_safe = np.clip(i0, 0, nz - 1)
+    ilast_safe = np.clip(i1 - 1, 0, nz - 1)
 
-        ndnodes[0] = boundary_value(nd2, pt, it_lo, it_hi)
-        signodes[0] = boundary_value(sig2, pt, it_lo, it_hi)
-        ndnodes[-1] = boundary_value(nd2, pb, ib_lo, ib_hi)
-        signodes[-1] = boundary_value(sig2, pb, ib_lo, ib_hi)
+    # Require every interior Nd node to be finite and above threshold.
+    bad_nd_node = (~np.isfinite(nd2d)) | (nd2d <= nd_threshold)
+    bad_nd_prefix = np.vstack(
+        [
+            np.zeros((1, ncol), dtype=np.int16),
+            np.cumsum(bad_nd_node, axis=0, dtype=np.int16),
+        ]
+    )
+    interior_bad_nd = (
+        bad_nd_prefix[np.clip(i1, 0, nz), cols]
+        - bad_nd_prefix[np.clip(i0, 0, nz), cols]
+    )
 
-        if interior_idx.size:
-            ndnodes[1:-1] = nd2[interior_idx, c]
-            signodes[1:-1] = sig2[interior_idx, c]
+    valid_nd = (
+        structural_valid
+        & np.isfinite(nd_top)
+        & (nd_top > nd_threshold)
+        & np.isfinite(nd_bottom)
+        & (nd_bottom > nd_threshold)
+        & (interior_bad_nd == 0)
+    )
 
-        valid_nd = np.all(np.isfinite(ndnodes)) and np.all(ndnodes > nd_threshold)
-        if not valid_nd:
-            continue
+    # R uses the same pressure nodes and additionally requires valid sigmaNd.
+    bad_sig_node = (~np.isfinite(sig2d)) | (sig2d < 0.0)
+    bad_sig_prefix = np.vstack(
+        [
+            np.zeros((1, ncol), dtype=np.int16),
+            np.cumsum(bad_sig_node, axis=0, dtype=np.int16),
+        ]
+    )
+    interior_bad_sig = (
+        bad_sig_prefix[np.clip(i1, 0, nz), cols]
+        - bad_sig_prefix[np.clip(i0, 0, nz), cols]
+    )
+    valid_sigma = (
+        structural_valid
+        & np.isfinite(sig_top)
+        & (sig_top >= 0.0)
+        & np.isfinite(sig_bottom)
+        & (sig_bottom >= 0.0)
+        & (interior_bad_sig == 0)
+    )
 
-        x = np.log(pnodes)
-        span = x[-1] - x[0]
-        if not np.isfinite(span) or span <= 0.0:
-            continue
+    dx = np.diff(x)[:, None]
 
-        nd_mean = np.trapz(ndnodes, x=x) / span
-        if not np.isfinite(nd_mean) or nd_mean < MIN_LAYER_MEAN_ND:
-            continue
+    def _node_prefix(q):
+        """Integral from p[0] to every model node using full trapezoids."""
+        seg = 0.5 * (q[:-1] + q[1:]) * dx
+        # Invalid segments are harmless because any interval containing them
+        # is rejected by the strict node-validity masks above.
+        seg = np.where(np.isfinite(seg), seg, 0.0)
+        return np.vstack(
+            [
+                np.zeros((1, ncol), dtype=np.float64),
+                np.cumsum(seg, axis=0, dtype=np.float64),
+            ]
+        )
 
-        variance = np.trapz((ndnodes - nd_mean) ** 2, x=x) / span
-        variance = max(float(variance), 0.0)
-        vertical_rms = np.sqrt(variance)
-        H[c] = np.float32(vertical_rms / nd_mean)
+    nd_prefix = _node_prefix(nd2d)
+    nd2_prefix = _node_prefix(nd2d * nd2d)
+    sig2_prefix = _node_prefix(sig2d * sig2d)
 
-        valid_sigma = np.all(np.isfinite(signodes)) and np.all(signodes >= 0.0)
-        if valid_sigma:
-            sigma_rms = np.sqrt(
-                max(float(np.trapz(signodes ** 2, x=x) / span), 0.0)
-            )
-            if np.isfinite(sigma_rms) and sigma_rms > MIN_SIGMA_RMS:
-                R[c] = np.float32(vertical_rms / sigma_rms)
+    def _interval_integral(prefix, q, q_top, q_bottom):
+        """
+        Exact trapezoidal integral on the conceptual variable node set.
+
+        Splitting the two boundary segments explicitly is important: for the
+        second moments the interpolated boundary value must be squared *after*
+        interpolation, matching the original per-column implementation.
+        """
+        first = (
+            0.5
+            * (q_top + q[i0_safe, cols])
+            * (x[i0_safe] - x_top)
+        )
+        last = (
+            0.5
+            * (q[ilast_safe, cols] + q_bottom)
+            * (x_bottom - x[ilast_safe])
+        )
+        middle = (
+            prefix[ilast_safe, cols]
+            - prefix[i0_safe, cols]
+        )
+        return first + middle + last
+
+    int_nd = _interval_integral(
+        nd_prefix, nd2d, nd_top, nd_bottom
+    )
+    int_nd2 = _interval_integral(
+        nd2_prefix, nd2d * nd2d, nd_top * nd_top, nd_bottom * nd_bottom
+    )
+    int_sig2 = _interval_integral(
+        sig2_prefix, sig2d * sig2d, sig_top * sig_top, sig_bottom * sig_bottom
+    )
+
+    span = x_bottom - x_top
+
+    nd_mean = int_nd / span
+    nd_second = int_nd2 / span
+    variance = np.maximum(nd_second - nd_mean * nd_mean, 0.0)
+    vertical_rms = np.sqrt(variance)
+
+    valid_H = (
+        valid_nd
+        & np.isfinite(nd_mean)
+        & (nd_mean >= MIN_LAYER_MEAN_ND)
+        & np.isfinite(vertical_rms)
+    )
+    H[valid_H] = (
+        vertical_rms[valid_H] / nd_mean[valid_H]
+    ).astype(np.float32)
+
+    sigma_second = int_sig2 / span
+    sigma_rms = np.sqrt(np.maximum(sigma_second, 0.0))
+
+    valid_R = (
+        valid_H
+        & valid_sigma
+        & np.isfinite(sigma_rms)
+        & (sigma_rms > MIN_SIGMA_RMS)
+    )
+    R[valid_R] = (
+        vertical_rms[valid_R] / sigma_rms[valid_R]
+    ).astype(np.float32)
 
     return H.reshape(ny, nx), R.reshape(ny, nx)
 
