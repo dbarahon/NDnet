@@ -867,7 +867,7 @@ def plot_climatology(h_threshold, out_png=OUT_PNG):
 
     column_titles = [
         r"Median $H$",
-        rf"Days with $H>{h_threshold:g}$",
+        rf"Days with $H>{100.0*h_threshold:g}\\%$",
         r"Median $R$",
     ]
     right_formats = [
