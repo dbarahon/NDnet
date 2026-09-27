@@ -130,7 +130,7 @@ LAT_TICKS = [-60, -30, 0, 30, 60]
 DATE_RE = re.compile(r"(\d{8})")
 EPOCH = date(1970, 1, 1)
 
-ALGORITHM_VERSION = 4
+ALGORITHM_VERSION = 5
 
 
 # ============================================================
@@ -399,22 +399,30 @@ def _compute_variable_bound_H_R(
     nd_threshold,
 ):
     """
-    Vectorized H and R for per-column [Ptop, Pbottom].
+    Compute H and R over the MODIS-top / Nd-bottom layer, skipping NaNs.
 
-    This is mathematically equivalent to constructing the pressure nodes
-    [Ptop, interior model levels, Pbottom] separately for every grid column,
-    but avoids the extremely expensive Python loop over columns.
+    Pbottom is defined elsewhere using Nd > nd_threshold; the threshold is not
+    otherwise used to reject finite Nd values inside the selected layer.
 
-    Boundary Nd and sigmaNd are linearly interpolated in ln(p). Trapezoidal
-    moments are then assembled from:
-      1) the partial top segment,
-      2) cumulative full model-level segments, and
-      3) the partial bottom segment.
+    For H:
+      * retain every finite model-level Nd between Ptop and Pbottom;
+      * skip NaNs and connect consecutive retained nodes in ln(p);
+      * require at least MIN_INTEGRATION_LEVELS finite model-level Nd values.
 
-    At least MIN_INTEGRATION_LEVELS pressure nodes are required. All selected
-    Nd nodes must be finite and > nd_threshold. R additionally requires finite
-    nonnegative sigmaNd at the same nodes.
+    For R:
+      * retain model levels where both Nd and sigmaNd are finite and sigmaNd >= 0;
+      * skip missing levels in the same way;
+      * require at least MIN_INTEGRATION_LEVELS paired model-level values;
+      * compute both the Nd variance and <sigmaNd^2> over that common support.
+
+    If the MODIS Ptop lies between model levels and both bracketing values are
+    finite, an interpolated boundary node at the exact MODIS pressure is added
+    to the trapezoid. That virtual boundary does not count toward the minimum
+    number of observed/model levels. If it cannot be interpolated because of a
+    NaN, integration simply starts at the first finite model level below Ptop.
     """
+    del nd_threshold  # used only to define Pbottom before this function
+
     p = np.asarray(p_hpa, dtype=np.float64)
     order = np.argsort(p)
     p = p[order]
@@ -445,170 +453,183 @@ def _compute_variable_bound_H_R(
     if not np.any(base_valid):
         return H.reshape(ny, nx), R.reshape(ny, nx)
 
-    # Safe placeholders keep all vectorized index operations in bounds.
     top_safe = np.where(base_valid, top, p[0])
     bottom_safe = np.where(base_valid, bottom, p[-1])
     x_top = np.log(top_safe)
-    x_bottom = np.log(bottom_safe)
 
-    def _interp_at(field, target, x_target):
-        lo = np.searchsorted(p, target, side="right") - 1
+    # Interpolate an exact MODIS-top boundary where possible. If either
+    # bracketing value is NaN, the boundary is omitted and the sparse
+    # integration starts at the first finite model level below Ptop.
+    def _interp_at_top(field):
+        lo = np.searchsorted(p, top_safe, side="right") - 1
         lo = np.clip(lo, 0, nz - 2)
         hi = lo + 1
-        alpha = (x_target - x[lo]) / (x[hi] - x[lo])
-        value = (
+        alpha = (x_top - x[lo]) / (x[hi] - x[lo])
+        return (
             (1.0 - alpha) * field[lo, cols]
             + alpha * field[hi, cols]
         )
-        return value
 
-    nd_top = _interp_at(nd2d, top_safe, x_top)
-    nd_bottom = _interp_at(nd2d, bottom_safe, x_bottom)
-    sig_top = _interp_at(sig2d, top_safe, x_top)
-    sig_bottom = _interp_at(sig2d, bottom_safe, x_bottom)
+    nd_top = _interp_at_top(nd2d)
+    sig_top = _interp_at_top(sig2d)
 
-    # Strictly interior model levels. The conceptual integration nodes are:
-    # [Ptop, p[i0], ..., p[i1-1], Pbottom].
-    i0 = np.searchsorted(p, top_safe, side="right")
-    i1 = np.searchsorted(p, bottom_safe, side="left")
-    n_nodes = 2 + (i1 - i0)
+    # Actual model levels inside the requested pressure interval. These are the
+    # levels counted for the >=3 requirement.
+    within = (
+        base_valid[None, :]
+        & (p[:, None] >= top_safe[None, :])
+        & (p[:, None] <= bottom_safe[None, :])
+    )
 
-    structural_valid = (
+    def _compressed_trapz_moments(field, valid, boundary_value, boundary_valid):
+        """
+        Trapezoidal first/second moments after removing invalid vertical nodes.
+
+        Keeping the previous valid node while stepping through the 22 pressure
+        levels is equivalent to np.trapz(field[valid], x[valid]) independently
+        in every column, but remains vectorized over the global horizontal grid.
+        """
+        count = valid.sum(axis=0, dtype=np.int16)
+
+        int1 = np.zeros(ncol, dtype=np.float64)
+        int2 = np.zeros(ncol, dtype=np.float64)
+
+        prev_x = np.full(ncol, np.nan, dtype=np.float64)
+        prev_q = np.full(ncol, np.nan, dtype=np.float64)
+        first_x = np.full(ncol, np.nan, dtype=np.float64)
+        last_x = np.full(ncol, np.nan, dtype=np.float64)
+
+        use_boundary = base_valid & boundary_valid
+        prev_x[use_boundary] = x_top[use_boundary]
+        prev_q[use_boundary] = boundary_value[use_boundary]
+        first_x[use_boundary] = x_top[use_boundary]
+        last_x[use_boundary] = x_top[use_boundary]
+
+        for k in range(nz):
+            use = valid[k]
+            if not np.any(use):
+                continue
+
+            q = field[k]
+            has_prev = use & np.isfinite(prev_q)
+            if np.any(has_prev):
+                dx = x[k] - prev_x[has_prev]
+                q0 = prev_q[has_prev]
+                q1 = q[has_prev]
+                int1[has_prev] += 0.5 * (q0 + q1) * dx
+                int2[has_prev] += 0.5 * (q0 * q0 + q1 * q1) * dx
+
+            first = use & ~np.isfinite(prev_q)
+            first_x[first] = x[k]
+
+            prev_x[use] = x[k]
+            prev_q[use] = q[use]
+            last_x[use] = x[k]
+
+        span = last_x - first_x
+        return int1, int2, span, count
+
+    # H: any finite Nd values inside the MODIS-to-bottom layer are accepted.
+    nd_valid = within & np.isfinite(nd2d)
+    nd_boundary_valid = np.isfinite(nd_top)
+
+    int_nd, int_nd2, span_nd, count_nd = _compressed_trapz_moments(
+        nd2d,
+        nd_valid,
+        nd_top,
+        nd_boundary_valid,
+    )
+
+    good_H = (
         base_valid
-        & (n_nodes >= MIN_INTEGRATION_LEVELS)
-        & (i0 < i1)
-        & (i0 < nz)
-        & (i1 > 0)
+        & (count_nd >= MIN_INTEGRATION_LEVELS)
+        & np.isfinite(span_nd)
+        & (span_nd > 0.0)
     )
 
-    # Safe gather indices for columns later masked as invalid.
-    i0_safe = np.clip(i0, 0, nz - 1)
-    ilast_safe = np.clip(i1 - 1, 0, nz - 1)
+    nd_mean = np.full(ncol, np.nan, dtype=np.float64)
+    nd_second = np.full(ncol, np.nan, dtype=np.float64)
+    nd_mean[good_H] = int_nd[good_H] / span_nd[good_H]
+    nd_second[good_H] = int_nd2[good_H] / span_nd[good_H]
 
-    # Require every selected Nd node to be finite and above threshold.
-    bad_nd_node = (~np.isfinite(nd2d)) | (nd2d <= nd_threshold)
-    bad_nd_prefix = np.vstack(
-        [
-            np.zeros((1, ncol), dtype=np.int16),
-            np.cumsum(bad_nd_node, axis=0, dtype=np.int16),
-        ]
+    variance = np.full(ncol, np.nan, dtype=np.float64)
+    variance[good_H] = np.maximum(
+        nd_second[good_H] - nd_mean[good_H] ** 2,
+        0.0,
     )
-    interior_bad_nd = (
-        bad_nd_prefix[np.clip(i1, 0, nz), cols]
-        - bad_nd_prefix[np.clip(i0, 0, nz), cols]
-    )
-
-    valid_nd = (
-        structural_valid
-        & np.isfinite(nd_top)
-        & (nd_top > nd_threshold)
-        & np.isfinite(nd_bottom)
-        & (nd_bottom > nd_threshold)
-        & (interior_bad_nd == 0)
-    )
-
-    # R uses the same pressure nodes and additionally requires valid sigmaNd.
-    bad_sig_node = (~np.isfinite(sig2d)) | (sig2d < 0.0)
-    bad_sig_prefix = np.vstack(
-        [
-            np.zeros((1, ncol), dtype=np.int16),
-            np.cumsum(bad_sig_node, axis=0, dtype=np.int16),
-        ]
-    )
-    interior_bad_sig = (
-        bad_sig_prefix[np.clip(i1, 0, nz), cols]
-        - bad_sig_prefix[np.clip(i0, 0, nz), cols]
-    )
-    valid_sigma = (
-        structural_valid
-        & np.isfinite(sig_top)
-        & (sig_top >= 0.0)
-        & np.isfinite(sig_bottom)
-        & (sig_bottom >= 0.0)
-        & (interior_bad_sig == 0)
-    )
-
-    dx = np.diff(x)[:, None]
-
-    def _node_prefix(q):
-        """Integral from p[0] to every model node using full trapezoids."""
-        seg = 0.5 * (q[:-1] + q[1:]) * dx
-        # Invalid segments are harmless because any interval containing them
-        # is rejected by the strict node-validity masks above.
-        seg = np.where(np.isfinite(seg), seg, 0.0)
-        return np.vstack(
-            [
-                np.zeros((1, ncol), dtype=np.float64),
-                np.cumsum(seg, axis=0, dtype=np.float64),
-            ]
-        )
-
-    nd_prefix = _node_prefix(nd2d)
-    nd2_prefix = _node_prefix(nd2d * nd2d)
-    sig2_prefix = _node_prefix(sig2d * sig2d)
-
-    def _interval_integral(prefix, q, q_top, q_bottom):
-        """
-        Exact trapezoidal integral on the conceptual variable node set.
-
-        Splitting the two boundary segments explicitly is important: for the
-        second moments the interpolated boundary value must be squared *after*
-        interpolation, matching the original per-column implementation.
-        """
-        first = (
-            0.5
-            * (q_top + q[i0_safe, cols])
-            * (x[i0_safe] - x_top)
-        )
-        last = (
-            0.5
-            * (q[ilast_safe, cols] + q_bottom)
-            * (x_bottom - x[ilast_safe])
-        )
-        middle = (
-            prefix[ilast_safe, cols]
-            - prefix[i0_safe, cols]
-        )
-        return first + middle + last
-
-    int_nd = _interval_integral(
-        nd_prefix, nd2d, nd_top, nd_bottom
-    )
-    int_nd2 = _interval_integral(
-        nd2_prefix, nd2d * nd2d, nd_top * nd_top, nd_bottom * nd_bottom
-    )
-    int_sig2 = _interval_integral(
-        sig2_prefix, sig2d * sig2d, sig_top * sig_top, sig_bottom * sig_bottom
-    )
-
-    span = x_bottom - x_top
-
-    nd_mean = int_nd / span
-    nd_second = int_nd2 / span
-    variance = np.maximum(nd_second - nd_mean * nd_mean, 0.0)
     vertical_rms = np.sqrt(variance)
 
-    valid_H = (
-        valid_nd
-        & np.isfinite(nd_mean)
-        & (nd_mean >= MIN_LAYER_MEAN_ND)
+    good_H &= (
+        np.isfinite(nd_mean)
+        & (nd_mean > 0.0)
         & np.isfinite(vertical_rms)
     )
-    H[valid_H] = (
-        vertical_rms[valid_H] / nd_mean[valid_H]
+    H[good_H] = (
+        vertical_rms[good_H] / nd_mean[good_H]
     ).astype(np.float32)
 
-    sigma_second = int_sig2 / span
+    # R: use common finite Nd/sigmaNd support so numerator and denominator
+    # represent exactly the same retained pressure nodes.
+    pair_valid = (
+        within
+        & np.isfinite(nd2d)
+        & np.isfinite(sig2d)
+        & (sig2d >= 0.0)
+    )
+    pair_boundary_valid = (
+        np.isfinite(nd_top)
+        & np.isfinite(sig_top)
+        & (sig_top >= 0.0)
+    )
+
+    int_nd_pair, int_nd2_pair, span_pair, count_pair = (
+        _compressed_trapz_moments(
+            nd2d,
+            pair_valid,
+            nd_top,
+            pair_boundary_valid,
+        )
+    )
+    _, int_sig2_pair, span_sig, count_sig = _compressed_trapz_moments(
+        sig2d,
+        pair_valid,
+        sig_top,
+        pair_boundary_valid,
+    )
+
+    good_R = (
+        base_valid
+        & (count_pair >= MIN_INTEGRATION_LEVELS)
+        & (count_sig >= MIN_INTEGRATION_LEVELS)
+        & np.isfinite(span_pair)
+        & np.isfinite(span_sig)
+        & (span_pair > 0.0)
+        & np.isclose(span_pair, span_sig, rtol=0.0, atol=1.0e-12)
+    )
+
+    nd_pair_mean = np.full(ncol, np.nan, dtype=np.float64)
+    nd_pair_second = np.full(ncol, np.nan, dtype=np.float64)
+    sigma_second = np.full(ncol, np.nan, dtype=np.float64)
+
+    nd_pair_mean[good_R] = int_nd_pair[good_R] / span_pair[good_R]
+    nd_pair_second[good_R] = int_nd2_pair[good_R] / span_pair[good_R]
+    sigma_second[good_R] = int_sig2_pair[good_R] / span_pair[good_R]
+
+    pair_variance = np.full(ncol, np.nan, dtype=np.float64)
+    pair_variance[good_R] = np.maximum(
+        nd_pair_second[good_R] - nd_pair_mean[good_R] ** 2,
+        0.0,
+    )
+    pair_rms = np.sqrt(pair_variance)
     sigma_rms = np.sqrt(np.maximum(sigma_second, 0.0))
 
-    valid_R = (
-        valid_H
-        & valid_sigma
+    good_R &= (
+        np.isfinite(pair_rms)
         & np.isfinite(sigma_rms)
         & (sigma_rms > MIN_SIGMA_RMS)
     )
-    R[valid_R] = (
-        vertical_rms[valid_R] / sigma_rms[valid_R]
+    R[good_R] = (
+        pair_rms[good_R] / sigma_rms[good_R]
     ).astype(np.float32)
 
     return H.reshape(ny, nx), R.reshape(ny, nx)
@@ -687,7 +708,8 @@ def _create_annual_output(path, year, lat, lon, nd_threshold, h_threshold):
 
     nc.setncattr("year", int(year))
     nc.setncattr("integration_coordinate", "ln(pressure)")
-    nc.setncattr("boundary_interpolation", "linear in ln(pressure)")
+    nc.setncattr("boundary_interpolation", "MODIS top interpolated in ln(pressure) when bracketing values are finite")
+    nc.setncattr("nan_policy", "skip NaNs; integrate across retained finite pressure nodes")
     nc.setncattr("cloud_top_definition", "MODIS Cloud_Top_Pressure_Mean")
     nc.setncattr("nd_threshold_cm-3", float(nd_threshold))
     nc.setncattr("h_exceedance_threshold", float(h_threshold))
@@ -824,7 +846,7 @@ def compute_all_years(nd_threshold, h_threshold, workers=N_WORKERS):
         f"Pbottom: lowest Nd > {nd_threshold:g} cm^-3; "
         f"Ptop: MODIS {MODIS_VAR}; "
         f"H exceedance threshold={h_threshold:g} ({100*h_threshold:g}%); "
-        f"minimum integration levels={MIN_INTEGRATION_LEVELS}."
+        f"minimum finite integration levels={MIN_INTEGRATION_LEVELS}; NaNs skipped."
     )
 
     years = sorted(grouped)
