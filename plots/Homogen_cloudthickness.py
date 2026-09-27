@@ -5,7 +5,8 @@ Daily cloud-thickness Nd heterogeneity using variable pressure bounds.
 For each daily NDnet grid column, define
     Pbottom = lowermost pressure level with Nd > ND_THRESHOLD_CM3
 and use two alternative cloud-top pressures:
-    row 1: Ptop = uppermost pressure level with Nd > ND_THRESHOLD_CM3
+    row 1: starting at Pbottom and moving upward, Ptop is the first finite
+           pressure level with Nd < ND_THRESHOLD_CM3
     row 2: Ptop = MODIS Cloud_Top_Pressure_Mean
 
 Within [Ptop, Pbottom], all moments are integrated in ln(p), requiring at
@@ -138,7 +139,7 @@ TOP_METHOD_LABELS = (
     r"$P_{\rm top}$ from MODIS",
 )
 
-ALGORITHM_VERSION = 2
+ALGORITHM_VERSION = 3
 
 
 # ============================================================
@@ -379,25 +380,73 @@ def _read_modis_ctp(day, expected_lat, expected_lon):
 
 def _cloud_bounds_from_nd(nd, p_hpa, nd_threshold):
     """
-    Return Ptop/Pbottom from the uppermost/lowermost model levels satisfying
-    Nd > threshold. Since pressure increases downward, uppermost=min(p) and
-    lowermost=max(p).
+    Return the Nd-defined cloud bounds for the contiguous layer connected to
+    the lowermost cloudy level.
+
+    Pbottom is the lowest-pressure-coordinate level (largest pressure) with
+    Nd > threshold. Starting there and moving upward (toward smaller pressure),
+    levels remain inside the layer while finite Nd >= threshold. Ptop is the
+    first finite level encountered with Nd < threshold.
+
+    A NaN encountered before the threshold crossing invalidates Ptop rather
+    than allowing the search to jump across an unsupported vertical gap.
     """
     p = np.asarray(p_hpa, dtype=np.float64)
     order = np.argsort(p)
     p_sorted = p[order]
     nd_sorted = np.asarray(nd, dtype=np.float64)[order]
 
-    cloudy = np.isfinite(nd_sorted) & (nd_sorted > nd_threshold)
-    any_cloud = cloudy.any(axis=0)
+    finite = np.isfinite(nd_sorted)
+    cloudy_for_bottom = finite & (nd_sorted > nd_threshold)
+    any_cloud = cloudy_for_bottom.any(axis=0)
 
-    first = np.argmax(cloudy, axis=0)
-    last = cloudy.shape[0] - 1 - np.argmax(cloudy[::-1], axis=0)
+    # Lowest cloudy level: pressure increases with the sorted index.
+    bottom_idx = (
+        cloudy_for_bottom.shape[0]
+        - 1
+        - np.argmax(cloudy_for_bottom[::-1], axis=0)
+    )
+
+    pbottom = np.full(any_cloud.shape, np.nan, dtype=np.float32)
+    pbottom[any_cloud] = p_sorted[bottom_idx[any_cloud]].astype(np.float32)
+
+    # Moving upward from Pbottom, Nd == threshold is still part of the
+    # contiguous layer because the requested stopping condition is Nd < threshold.
+    continuation = finite & (nd_sorted >= nd_threshold)
+    break_level = ~continuation
+
+    level_index = np.arange(len(p_sorted), dtype=np.int32)[:, None, None]
+    previous_break = np.maximum.accumulate(
+        np.where(break_level, level_index, -1),
+        axis=0,
+    )
+
+    # Find the nearest break strictly above Pbottom.
+    lookup = np.clip(bottom_idx - 1, 0, len(p_sorted) - 1)
+    nearest_break = np.take_along_axis(
+        previous_break,
+        lookup[None, :, :],
+        axis=0,
+    )[0]
+
+    safe_break = np.clip(nearest_break, 0, len(p_sorted) - 1)
+    nd_at_break = np.take_along_axis(
+        nd_sorted,
+        safe_break[None, :, :],
+        axis=0,
+    )[0]
+
+    valid_top = (
+        any_cloud
+        & (bottom_idx > 0)
+        & (nearest_break >= 0)
+        & np.isfinite(nd_at_break)
+        & (nd_at_break < nd_threshold)
+    )
 
     ptop = np.full(any_cloud.shape, np.nan, dtype=np.float32)
-    pbottom = np.full(any_cloud.shape, np.nan, dtype=np.float32)
-    ptop[any_cloud] = p_sorted[first[any_cloud]].astype(np.float32)
-    pbottom[any_cloud] = p_sorted[last[any_cloud]].astype(np.float32)
+    ptop[valid_top] = p_sorted[safe_break[valid_top]].astype(np.float32)
+
     return ptop, pbottom
 
 
@@ -408,6 +457,7 @@ def _compute_variable_bound_H_R(
     ptop,
     pbottom,
     nd_threshold,
+    nd_top_is_subthreshold=False,
 ):
     """
     Vectorized H and R for per-column [Ptop, Pbottom].
@@ -422,9 +472,12 @@ def _compute_variable_bound_H_R(
       2) cumulative full model-level segments, and
       3) the partial bottom segment.
 
-    At least MIN_INTEGRATION_LEVELS pressure nodes are required. All selected
-    Nd nodes must be finite and > nd_threshold. R additionally requires finite
-    nonnegative sigmaNd at the same nodes.
+    At least MIN_INTEGRATION_LEVELS pressure nodes are required. For the MODIS
+    top, all selected Nd nodes must be finite and > nd_threshold. For the
+    Nd-defined top, the top boundary itself must be finite and < nd_threshold,
+    while all interior nodes must be finite and >= nd_threshold and Pbottom
+    remains strictly > nd_threshold. R additionally requires finite nonnegative
+    sigmaNd at the same nodes.
     """
     p = np.asarray(p_hpa, dtype=np.float64)
     order = np.argsort(p)
@@ -496,8 +549,16 @@ def _compute_variable_bound_H_R(
     i0_safe = np.clip(i0, 0, nz - 1)
     ilast_safe = np.clip(i1 - 1, 0, nz - 1)
 
-    # Require every interior Nd node to be finite and above threshold.
-    bad_nd_node = (~np.isfinite(nd2d)) | (nd2d <= nd_threshold)
+    # The Nd-defined top is deliberately the first sub-threshold model level.
+    # For that method, interior values equal to the threshold remain admissible
+    # because the upward search stops only when Nd < threshold.
+    if nd_top_is_subthreshold:
+        bad_nd_node = (~np.isfinite(nd2d)) | (nd2d < nd_threshold)
+        top_nd_valid = np.isfinite(nd_top) & (nd_top < nd_threshold)
+    else:
+        bad_nd_node = (~np.isfinite(nd2d)) | (nd2d <= nd_threshold)
+        top_nd_valid = np.isfinite(nd_top) & (nd_top > nd_threshold)
+
     bad_nd_prefix = np.vstack(
         [
             np.zeros((1, ncol), dtype=np.int16),
@@ -511,8 +572,7 @@ def _compute_variable_bound_H_R(
 
     valid_nd = (
         structural_valid
-        & np.isfinite(nd_top)
-        & (nd_top > nd_threshold)
+        & top_nd_valid
         & np.isfinite(nd_bottom)
         & (nd_bottom > nd_threshold)
         & (interior_bad_nd == 0)
@@ -648,7 +708,9 @@ def _create_annual_output(path, year, lat, lon, nd_threshold, h_threshold):
     mvar = nc.createVariable("top_method", "i1", ("top_method",))
     mvar[:] = np.arange(2, dtype=np.int8)
     mvar.long_name = "cloud-top pressure definition"
-    mvar.method_0 = "uppermost NDnet pressure level with Nd > threshold"
+    mvar.method_0 = (
+        "from Pbottom upward: first finite NDnet pressure level with Nd < threshold"
+    )
     mvar.method_1 = "MODIS Cloud_Top_Pressure_Mean"
 
     latvar = nc.createVariable(LAT_DIM, "f8", (LAT_DIM,))
@@ -796,7 +858,13 @@ def _process_one_year(year, files, nd_threshold, h_threshold):
             )
 
             H_nd, R_nd = _compute_variable_bound_H_R(
-                nd, sigma, p_hpa, ptop_nd, pbottom, nd_threshold
+                nd,
+                sigma,
+                p_hpa,
+                ptop_nd,
+                pbottom,
+                nd_threshold,
+                nd_top_is_subthreshold=True,
             )
             H_modis, R_modis = _compute_variable_bound_H_R(
                 nd, sigma, p_hpa, ptop_modis, pbottom, nd_threshold
@@ -828,7 +896,8 @@ def compute_all_years(nd_threshold, h_threshold, workers=N_WORKERS):
 
     print(f"Found {len(files)} NDnet daily files spanning {len(grouped)} years.")
     print(
-        f"Pbottom/Ptop(Nd): Nd > {nd_threshold:g} cm^-3; "
+        f"Pbottom: lowest Nd > {nd_threshold:g} cm^-3; "
+        f"Ptop(Nd): first upward Nd < {nd_threshold:g} cm^-3; "
         f"H exceedance threshold={h_threshold:g} ({100*h_threshold:g}%); "
         f"minimum integration levels={MIN_INTEGRATION_LEVELS}."
     )
@@ -1143,8 +1212,9 @@ def main():
         type=float,
         default=ND_THRESHOLD_CM3,
         help=(
-            "Nd threshold (cm^-3) defining lowermost/uppermost cloudy model "
-            f"levels (default: {ND_THRESHOLD_CM3:g})"
+            "Nd threshold (cm^-3): Pbottom is the lowermost level above it; "
+            "Nd Ptop is the first level below it when scanning upward "
+            f"(default: {ND_THRESHOLD_CM3:g})"
         ),
     )
     parser.add_argument(
