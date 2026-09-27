@@ -1,5 +1,41 @@
 #!/usr/bin/env python3
 """
+Daily cloud-thickness Nd heterogeneity using MODIS cloud-top pressure.
+
+For each daily NDnet grid column:
+    Pbottom = lowermost pressure level with Nd > ND_THRESHOLD_CM3
+    Ptop    = MODIS Cloud_Top_Pressure_Mean
+
+Within [Ptop, Pbottom], all moments are integrated in ln(p), requiring at
+least three pressure nodes per integral:
+    <Nd> = integral Nd dlnp / Delta lnp
+    V = integral (Nd - <Nd>)^2 dlnp / Delta lnp
+    H = sqrt(V) / <Nd>
+    R = sqrt(V) / sqrt(<sigmaNd^2>)
+
+The journal figure is 1 x 3:
+    median H (%), percent of valid days with H > H_THRESHOLD,
+    and median R.
+
+Daily H/R are written to MODIS-only annual intermediates so exact temporal
+medians can be calculated in spatial tiles without loading the full multi-year
+cube.
+
+MODIS source follows inference/config.py and inference/data_handling.py:
+    /panfs/ccds02/nobackup/people/dbarahon/NDnet/data/dailies/
+      MCD06COSP_D3_MODIS/on_Noutgrid/MCD06COSP_D3_MODIS.*YYYYMM*.nc
+Variable:
+    Cloud_Top_Pressure_Mean
+
+Examples
+--------
+    python Homogen_cloudthickness.py compute
+    python Homogen_cloudthickness.py plot
+    python Homogen_cloudthickness.py all
+
+Optional:
+    python Homogen_cloudthickness.py all --nd-threshold 1 --h-threshold 0.3
+"""
 Daily cloud-thickness Nd heterogeneity using variable pressure bounds.
 
 For each daily NDnet grid column, define
@@ -43,7 +79,6 @@ import argparse
 import glob
 import os
 import re
-import string
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date
@@ -98,7 +133,7 @@ H_THRESHOLD = 0.30
 MIN_INTEGRATION_LEVELS = 3
 
 ANNUAL_OUT_DIR = "H_cloudthickness_annual"
-ANNUAL_PREFIX = "Nd_cloudthickness_HR"
+ANNUAL_PREFIX = "Nd_cloudthickness_MODIS_HR"
 OVERWRITE_ANNUAL = False
 
 N_WORKERS = 4
@@ -109,7 +144,7 @@ TILE_LAT = 45
 TILE_LON = 90
 MIN_VALID_DAYS = 30
 
-OUT_PNG = "Nd_cloudthickness_heterogeneity.png"
+OUT_PNG = "Nd_cloudthickness_MODIS_heterogeneity.png"
 
 CMAP_H = "turbo"
 CMAP_FREQ = "turbo"
@@ -133,13 +168,7 @@ LAT_TICKS = [-60, -30, 0, 30, 60]
 DATE_RE = re.compile(r"(\d{8})")
 EPOCH = date(1970, 1, 1)
 
-TOP_METHODS = ("nd", "modis")
-TOP_METHOD_LABELS = (
-    r"$P_{\rm top}$ from $N_{\rm d}$",
-    r"$P_{\rm top}$ from MODIS",
-)
-
-ALGORITHM_VERSION = 3
+ALGORITHM_VERSION = 4
 
 
 # ============================================================
@@ -378,76 +407,25 @@ def _read_modis_ctp(day, expected_lat, expected_lon):
 # DAILY VARIABLE-BOUND DIAGNOSTICS
 # ============================================================
 
-def _cloud_bounds_from_nd(nd, p_hpa, nd_threshold):
+def _cloud_bottom_from_nd(nd, p_hpa, nd_threshold):
     """
-    Return the Nd-defined cloud bounds for the contiguous layer connected to
-    the lowermost cloudy level.
+    Return Pbottom as the lowermost model level with finite Nd > threshold.
 
-    Pbottom is the lowest-pressure-coordinate level (largest pressure) with
-    Nd > threshold. Starting there and moving upward (toward smaller pressure),
-    levels remain inside the layer while finite Nd >= threshold. Ptop is the
-    first finite level encountered with Nd < threshold.
-
-    A NaN encountered before the threshold crossing invalidates Ptop rather
-    than allowing the search to jump across an unsupported vertical gap.
+    Pressure is sorted from low to high, so the lowermost atmospheric level is
+    the qualifying level with the largest pressure.
     """
     p = np.asarray(p_hpa, dtype=np.float64)
     order = np.argsort(p)
     p_sorted = p[order]
     nd_sorted = np.asarray(nd, dtype=np.float64)[order]
 
-    finite = np.isfinite(nd_sorted)
-    cloudy_for_bottom = finite & (nd_sorted > nd_threshold)
-    any_cloud = cloudy_for_bottom.any(axis=0)
-
-    # Lowest cloudy level: pressure increases with the sorted index.
-    bottom_idx = (
-        cloudy_for_bottom.shape[0]
-        - 1
-        - np.argmax(cloudy_for_bottom[::-1], axis=0)
-    )
+    cloudy = np.isfinite(nd_sorted) & (nd_sorted > nd_threshold)
+    any_cloud = cloudy.any(axis=0)
+    last = cloudy.shape[0] - 1 - np.argmax(cloudy[::-1], axis=0)
 
     pbottom = np.full(any_cloud.shape, np.nan, dtype=np.float32)
-    pbottom[any_cloud] = p_sorted[bottom_idx[any_cloud]].astype(np.float32)
-
-    # Moving upward from Pbottom, Nd == threshold is still part of the
-    # contiguous layer because the requested stopping condition is Nd < threshold.
-    continuation = finite & (nd_sorted >= nd_threshold)
-    break_level = ~continuation
-
-    level_index = np.arange(len(p_sorted), dtype=np.int32)[:, None, None]
-    previous_break = np.maximum.accumulate(
-        np.where(break_level, level_index, -1),
-        axis=0,
-    )
-
-    # Find the nearest break strictly above Pbottom.
-    lookup = np.clip(bottom_idx - 1, 0, len(p_sorted) - 1)
-    nearest_break = np.take_along_axis(
-        previous_break,
-        lookup[None, :, :],
-        axis=0,
-    )[0]
-
-    safe_break = np.clip(nearest_break, 0, len(p_sorted) - 1)
-    nd_at_break = np.take_along_axis(
-        nd_sorted,
-        safe_break[None, :, :],
-        axis=0,
-    )[0]
-
-    valid_top = (
-        any_cloud
-        & (bottom_idx > 0)
-        & (nearest_break >= 0)
-        & np.isfinite(nd_at_break)
-        & (nd_at_break < nd_threshold)
-    )
-
-    ptop = np.full(any_cloud.shape, np.nan, dtype=np.float32)
-    ptop[valid_top] = p_sorted[safe_break[valid_top]].astype(np.float32)
-
-    return ptop, pbottom
+    pbottom[any_cloud] = p_sorted[last[any_cloud]].astype(np.float32)
+    return pbottom
 
 
 def _compute_variable_bound_H_R(
@@ -457,7 +435,6 @@ def _compute_variable_bound_H_R(
     ptop,
     pbottom,
     nd_threshold,
-    nd_top_is_subthreshold=False,
 ):
     """
     Vectorized H and R for per-column [Ptop, Pbottom].
@@ -472,12 +449,9 @@ def _compute_variable_bound_H_R(
       2) cumulative full model-level segments, and
       3) the partial bottom segment.
 
-    At least MIN_INTEGRATION_LEVELS pressure nodes are required. For the MODIS
-    top, all selected Nd nodes must be finite and > nd_threshold. For the
-    Nd-defined top, the top boundary itself must be finite and < nd_threshold,
-    while all interior nodes must be finite and >= nd_threshold and Pbottom
-    remains strictly > nd_threshold. R additionally requires finite nonnegative
-    sigmaNd at the same nodes.
+    At least MIN_INTEGRATION_LEVELS pressure nodes are required. All selected
+    Nd nodes must be finite and > nd_threshold. R additionally requires finite
+    nonnegative sigmaNd at the same nodes.
     """
     p = np.asarray(p_hpa, dtype=np.float64)
     order = np.argsort(p)
@@ -549,16 +523,8 @@ def _compute_variable_bound_H_R(
     i0_safe = np.clip(i0, 0, nz - 1)
     ilast_safe = np.clip(i1 - 1, 0, nz - 1)
 
-    # The Nd-defined top is deliberately the first sub-threshold model level.
-    # For that method, interior values equal to the threshold remain admissible
-    # because the upward search stops only when Nd < threshold.
-    if nd_top_is_subthreshold:
-        bad_nd_node = (~np.isfinite(nd2d)) | (nd2d < nd_threshold)
-        top_nd_valid = np.isfinite(nd_top) & (nd_top < nd_threshold)
-    else:
-        bad_nd_node = (~np.isfinite(nd2d)) | (nd2d <= nd_threshold)
-        top_nd_valid = np.isfinite(nd_top) & (nd_top > nd_threshold)
-
+    # Require every selected Nd node to be finite and above threshold.
+    bad_nd_node = (~np.isfinite(nd2d)) | (nd2d <= nd_threshold)
     bad_nd_prefix = np.vstack(
         [
             np.zeros((1, ncol), dtype=np.int16),
@@ -572,7 +538,8 @@ def _compute_variable_bound_H_R(
 
     valid_nd = (
         structural_valid
-        & top_nd_valid
+        & np.isfinite(nd_top)
+        & (nd_top > nd_threshold)
         & np.isfinite(nd_bottom)
         & (nd_bottom > nd_threshold)
         & (interior_bad_nd == 0)
@@ -697,21 +664,12 @@ def _create_annual_output(path, year, lat, lon, nd_threshold, h_threshold):
     nlon = len(lon)
 
     nc.createDimension(TIME_DIM, None)
-    nc.createDimension("top_method", 2)
     nc.createDimension(LAT_DIM, nlat)
     nc.createDimension(LON_DIM, nlon)
 
     tvar = nc.createVariable(TIME_DIM, "i4", (TIME_DIM,))
     tvar.units = "days since 1970-01-01 00:00:00"
     tvar.calendar = "proleptic_gregorian"
-
-    mvar = nc.createVariable("top_method", "i1", ("top_method",))
-    mvar[:] = np.arange(2, dtype=np.int8)
-    mvar.long_name = "cloud-top pressure definition"
-    mvar.method_0 = (
-        "from Pbottom upward: first finite NDnet pressure level with Nd < threshold"
-    )
-    mvar.method_1 = "MODIS Cloud_Top_Pressure_Mean"
 
     latvar = nc.createVariable(LAT_DIM, "f8", (LAT_DIM,))
     lonvar = nc.createVariable(LON_DIM, "f8", (LON_DIM,))
@@ -721,7 +679,6 @@ def _create_annual_output(path, year, lat, lon, nd_threshold, h_threshold):
     lonvar.units = "degrees_east"
 
     chunks = (
-        1,
         1,
         min(NC_CHUNK_LAT, nlat),
         min(NC_CHUNK_LON, nlon),
@@ -735,33 +692,41 @@ def _create_annual_output(path, year, lat, lon, nd_threshold, h_threshold):
     )
 
     hvar = nc.createVariable(
-        "H", "f4", (TIME_DIM, "top_method", LAT_DIM, LON_DIM), **kwargs
+        "H", "f4", (TIME_DIM, LAT_DIM, LON_DIM), **kwargs
     )
     hvar.units = "1"
-    hvar.long_name = "relative vertical RMS heterogeneity of Nd over daily cloud thickness"
+    hvar.long_name = (
+        "relative vertical RMS heterogeneity of Nd from MODIS cloud top "
+        "to Nd-derived cloud bottom"
+    )
     hvar.definition = "sqrt(<(Nd-<Nd>)^2>_lnp) / <Nd>_lnp"
 
     rvar = nc.createVariable(
-        "R", "f4", (TIME_DIM, "top_method", LAT_DIM, LON_DIM), **kwargs
+        "R", "f4", (TIME_DIM, LAT_DIM, LON_DIM), **kwargs
     )
     rvar.units = "1"
-    rvar.long_name = "daily cloud-thickness Nd heterogeneity relative to sigmaNd RMS"
+    rvar.long_name = (
+        "Nd heterogeneity relative to sigmaNd RMS from MODIS cloud top "
+        "to Nd-derived cloud bottom"
+    )
     rvar.definition = "sqrt(<(Nd-<Nd>)^2>_lnp) / sqrt(<sigmaNd^2>_lnp)"
 
     pbvar = nc.createVariable(
-        "Pbottom_nd", "f4", (TIME_DIM, LAT_DIM, LON_DIM),
-        zlib=True,
-        complevel=NETCDF_COMPLEVEL,
-        shuffle=True,
-        chunksizes=(1, min(NC_CHUNK_LAT, nlat), min(NC_CHUNK_LON, nlon)),
-        fill_value=np.float32(np.nan),
+        "Pbottom_nd", "f4", (TIME_DIM, LAT_DIM, LON_DIM), **kwargs
     )
     pbvar.units = "hPa"
     pbvar.long_name = "lowermost pressure level with Nd above threshold"
 
+    ptvar = nc.createVariable(
+        "Ptop_modis", "f4", (TIME_DIM, LAT_DIM, LON_DIM), **kwargs
+    )
+    ptvar.units = "hPa"
+    ptvar.long_name = "MODIS Cloud_Top_Pressure_Mean used as integration top"
+
     nc.setncattr("year", int(year))
     nc.setncattr("integration_coordinate", "ln(pressure)")
     nc.setncattr("boundary_interpolation", "linear in ln(pressure)")
+    nc.setncattr("cloud_top_definition", "MODIS Cloud_Top_Pressure_Mean")
     nc.setncattr("nd_threshold_cm-3", float(nd_threshold))
     nc.setncattr("h_exceedance_threshold", float(h_threshold))
     nc.setncattr("minimum_layer_mean_Nd_cm-3", float(MIN_LAYER_MEAN_ND))
@@ -842,7 +807,7 @@ def _process_one_year(year, files, nd_threshold, h_threshold):
                     f"shape {nd.shape} in {infile}"
                 )
 
-            ptop_nd, pbottom = _cloud_bounds_from_nd(
+            pbottom = _cloud_bottom_from_nd(
                 nd, p_hpa, nd_threshold
             )
 
@@ -857,25 +822,15 @@ def _process_one_year(year, files, nd_threshold, h_threshold):
                 modis_nc, day, (len(lat), len(lon))
             )
 
-            H_nd, R_nd = _compute_variable_bound_H_R(
-                nd,
-                sigma,
-                p_hpa,
-                ptop_nd,
-                pbottom,
-                nd_threshold,
-                nd_top_is_subthreshold=True,
-            )
-            H_modis, R_modis = _compute_variable_bound_H_R(
+            H, R = _compute_variable_bound_H_R(
                 nd, sigma, p_hpa, ptop_modis, pbottom, nd_threshold
             )
 
             out.variables[TIME_DIM][it] = (day - EPOCH).days
-            out.variables["H"][it, 0, :, :] = H_nd
-            out.variables["H"][it, 1, :, :] = H_modis
-            out.variables["R"][it, 0, :, :] = R_nd
-            out.variables["R"][it, 1, :, :] = R_modis
+            out.variables["H"][it, :, :] = H
+            out.variables["R"][it, :, :] = R
             out.variables["Pbottom_nd"][it, :, :] = pbottom
+            out.variables["Ptop_modis"][it, :, :] = ptop_modis
 
             if (it + 1) % 30 == 0 or (it + 1) == len(files):
                 print(f"[{year}] {it + 1:4d}/{len(files):4d} days", flush=True)
@@ -897,7 +852,7 @@ def compute_all_years(nd_threshold, h_threshold, workers=N_WORKERS):
     print(f"Found {len(files)} NDnet daily files spanning {len(grouped)} years.")
     print(
         f"Pbottom: lowest Nd > {nd_threshold:g} cm^-3; "
-        f"Ptop(Nd): first upward Nd < {nd_threshold:g} cm^-3; "
+        f"Ptop: MODIS {MODIS_VAR}; "
         f"H exceedance threshold={h_threshold:g} ({100*h_threshold:g}%); "
         f"minimum integration levels={MIN_INTEGRATION_LEVELS}."
     )
@@ -944,7 +899,7 @@ def _annual_files():
     )
 
 
-def _load_time_tile(datasets, var_name, method, yslice, xslice, ntime):
+def _load_time_tile(datasets, var_name, yslice, xslice, ntime):
     ny = yslice.stop - yslice.start
     nx = xslice.stop - xslice.start
     block = np.empty((ntime, ny, nx), dtype=np.float32)
@@ -953,7 +908,7 @@ def _load_time_tile(datasets, var_name, method, yslice, xslice, ntime):
     for nc in datasets:
         nt = len(nc.dimensions[TIME_DIM])
         block[t0:t0 + nt] = _filled_float32(
-            nc.variables[var_name][:, method, yslice, xslice]
+            nc.variables[var_name][:, yslice, xslice]
         )
         t0 += nt
     return block
@@ -972,57 +927,56 @@ def calculate_climatology(h_threshold):
         nlat = len(lat)
         nlon = len(lon)
 
-        med_H = np.full((2, nlat, nlon), np.nan, dtype=np.float32)
+        med_H = np.full((nlat, nlon), np.nan, dtype=np.float32)
         pct_H_gt = np.full_like(med_H, np.nan)
         med_R = np.full_like(med_H, np.nan)
 
-        for method in range(2):
-            print(f"Climatology: {TOP_METHODS[method]}")
-            for y0 in range(0, nlat, TILE_LAT):
-                y1 = min(y0 + TILE_LAT, nlat)
-                ys = slice(y0, y1)
+        print("Climatology: MODIS cloud top")
+        for y0 in range(0, nlat, TILE_LAT):
+            y1 = min(y0 + TILE_LAT, nlat)
+            ys = slice(y0, y1)
 
-                for x0 in range(0, nlon, TILE_LON):
-                    x1 = min(x0 + TILE_LON, nlon)
-                    xs = slice(x0, x1)
+            for x0 in range(0, nlon, TILE_LON):
+                x1 = min(x0 + TILE_LON, nlon)
+                xs = slice(x0, x1)
 
-                    hblock = _load_time_tile(
-                        datasets, "H", method, ys, xs, ntime
-                    )
-                    valid = np.isfinite(hblock)
-                    nvalid = valid.sum(axis=0)
-                    nexceed = ((hblock > h_threshold) & valid).sum(axis=0)
-                    good = nvalid >= MIN_VALID_DAYS
+                hblock = _load_time_tile(
+                    datasets, "H", ys, xs, ntime
+                )
+                valid = np.isfinite(hblock)
+                nvalid = valid.sum(axis=0)
+                nexceed = ((hblock > h_threshold) & valid).sum(axis=0)
+                good = nvalid >= MIN_VALID_DAYS
 
-                    pct = np.full(nvalid.shape, np.nan, dtype=np.float32)
-                    pct[good] = (
-                        100.0 * nexceed[good] / nvalid[good]
+                pct = np.full(nvalid.shape, np.nan, dtype=np.float32)
+                pct[good] = (
+                    100.0 * nexceed[good] / nvalid[good]
+                ).astype(np.float32)
+                pct_H_gt[ys, xs] = pct
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    hmed = np.nanmedian(
+                        hblock, axis=0, overwrite_input=True
                     ).astype(np.float32)
-                    pct_H_gt[method, ys, xs] = pct
+                hmed[~good] = np.nan
+                med_H[ys, xs] = 100.0 * hmed
 
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", category=RuntimeWarning)
-                        hmed = np.nanmedian(
-                            hblock, axis=0, overwrite_input=True
-                        ).astype(np.float32)
-                    hmed[~good] = np.nan
-                    med_H[method, ys, xs] = 100.0 * hmed
+                rblock = _load_time_tile(
+                    datasets, "R", ys, xs, ntime
+                )
+                rvalid = np.isfinite(rblock)
+                nrvalid = rvalid.sum(axis=0)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    rmed = np.nanmedian(
+                        rblock, axis=0, overwrite_input=True
+                    ).astype(np.float32)
+                rmed[nrvalid < MIN_VALID_DAYS] = np.nan
+                med_R[ys, xs] = rmed
 
-                    rblock = _load_time_tile(
-                        datasets, "R", method, ys, xs, ntime
-                    )
-                    rvalid = np.isfinite(rblock)
-                    nrvalid = rvalid.sum(axis=0)
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", category=RuntimeWarning)
-                        rmed = np.nanmedian(
-                            rblock, axis=0, overwrite_input=True
-                        ).astype(np.float32)
-                    rmed[nrvalid < MIN_VALID_DAYS] = np.nan
-                    med_R[method, ys, xs] = rmed
-
-                    del hblock, valid, nvalid, nexceed, pct, hmed
-                    del rblock, rvalid, nrvalid, rmed
+                del hblock, valid, nvalid, nexceed, pct, hmed
+                del rblock, rvalid, nrvalid, rmed
 
         return lat, lon, med_H, pct_H_gt, med_R
     finally:
@@ -1070,7 +1024,7 @@ def plot_climatology(h_threshold, out_png=OUT_PNG):
         mcolors.Normalize(vmin=R_COLOR_MIN, vmax=R_COLOR_MAX),
     ]
     cmaps = [CMAP_H, CMAP_FREQ, CMAP_R]
-    columns = [med_H, pct_H_gt, med_R]
+    fields = [med_H, pct_H_gt, med_R]
 
     column_titles = [
         r"Median $H$",
@@ -1083,86 +1037,82 @@ def plot_climatology(h_threshold, out_png=OUT_PNG):
         lambda x: rf"$\langle R\rangle$ = {x:.2f}",
     ]
 
-    fig = plt.figure(figsize=(11.6, 5.3))
+    fig = plt.figure(figsize=(11.6, 3.05))
     gs = GridSpec(
-        nrows=3,
+        nrows=2,
         ncols=3,
         figure=fig,
-        height_ratios=[1.0, 1.0, 0.10],
-        hspace=0.18,
+        height_ratios=[1.0, 0.12],
+        hspace=0.22,
         wspace=0.12,
         left=0.065,
         right=0.985,
-        bottom=0.09,
-        top=0.91,
+        bottom=0.13,
+        top=0.86,
     )
 
-    axes = np.empty((2, 3), dtype=object)
-    for row in range(2):
-        for col in range(3):
-            axes[row, col] = fig.add_subplot(gs[row, col], projection=proj)
+    axes = [
+        fig.add_subplot(gs[0, col], projection=proj)
+        for col in range(3)
+    ]
 
-    for col, title in enumerate(column_titles):
-        axes[0, col].text(
+    letters = ("a", "b", "c")
+    for col, ax in enumerate(axes):
+        field = fields[col]
+
+        ax.pcolormesh(
+            lon,
+            lat,
+            field,
+            transform=proj,
+            shading="auto",
+            cmap=cmaps[col],
+            norm=norms[col],
+        )
+        ax.coastlines(linewidth=0.55)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.25)
+        ax.set_global()
+
+        ax.set_xticks(LON_TICKS, crs=proj)
+        ax.set_yticks(LAT_TICKS, crs=proj)
+        ax.xaxis.set_major_formatter(
+            LongitudeFormatter(zero_direction_label=True)
+        )
+        ax.yaxis.set_major_formatter(LatitudeFormatter())
+        ax.tick_params(
+            axis="both",
+            which="major",
+            labelsize=7,
+            length=2.5,
+            width=0.6,
+            pad=1.5,
+        )
+
+        ax.text(
             0.5,
-            1.19,
-            title,
-            transform=axes[0, col].transAxes,
+            1.12,
+            column_titles[col],
+            transform=ax.transAxes,
             ha="center",
             va="bottom",
             fontsize=11,
             fontweight="bold",
             clip_on=False,
         )
+        ax.set_title(
+            f"({letters[col]})",
+            loc="left",
+            fontsize=9.5,
+            pad=3,
+        )
 
-    letters = list(string.ascii_lowercase[:6])
-    for row in range(2):
-        for col in range(3):
-            ax = axes[row, col]
-            field = columns[col][row]
-
-            ax.pcolormesh(
-                lon,
-                lat,
-                field,
-                transform=proj,
-                shading="auto",
-                cmap=cmaps[col],
-                norm=norms[col],
-            )
-            ax.coastlines(linewidth=0.55)
-            ax.add_feature(cfeature.BORDERS, linewidth=0.25)
-            ax.set_global()
-
-            ax.set_xticks(LON_TICKS, crs=proj)
-            ax.set_yticks(LAT_TICKS, crs=proj)
-            ax.xaxis.set_major_formatter(
-                LongitudeFormatter(zero_direction_label=True)
-            )
-            ax.yaxis.set_major_formatter(LatitudeFormatter())
-            ax.tick_params(
-                axis="both",
-                which="major",
-                labelsize=7,
-                length=2.5,
-                width=0.6,
-                pad=1.5,
-            )
-
-            ax.set_title(
-                f"({letters[row * 3 + col]})  {TOP_METHOD_LABELS[row]}",
-                loc="left",
-                fontsize=9.5,
-                pad=3,
-            )
-
-            gmean = _lat_weighted_global_mean(field, lat)
-            ax.set_title(
-                right_formats[col](gmean),
-                loc="right",
-                fontsize=9.5,
-                pad=3,
-            )
+        gmean = _lat_weighted_global_mean(field, lat)
+        ax.set_title(
+            right_formats[col](gmean),
+            loc="right",
+            fontsize=9.5,
+            pad=3,
+        )
 
     cbar_ticks = [H_CBAR_TICKS, FREQ_CBAR_TICKS, R_CBAR_TICKS]
     cbar_labels = [
@@ -1172,7 +1122,7 @@ def plot_climatology(h_threshold, out_png=OUT_PNG):
     ]
 
     for col in range(3):
-        cax = fig.add_subplot(gs[2, col])
+        cax = fig.add_subplot(gs[1, col])
         sm = plt.cm.ScalarMappable(norm=norms[col], cmap=cmaps[col])
         sm.set_array([])
         cbar = fig.colorbar(sm, cax=cax, orientation="horizontal")
@@ -1199,7 +1149,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Compute and plot daily cloud-thickness Nd heterogeneity using "
-            "Nd-derived or MODIS cloud-top pressure."
+            "MODIS cloud-top pressure."
         )
     )
     parser.add_argument(
@@ -1212,9 +1162,8 @@ def main():
         type=float,
         default=ND_THRESHOLD_CM3,
         help=(
-            "Nd threshold (cm^-3): Pbottom is the lowermost level above it; "
-            "Nd Ptop is the first level below it when scanning upward "
-            f"(default: {ND_THRESHOLD_CM3:g})"
+            "Nd threshold (cm^-3) defining Pbottom as the lowermost level "
+            f"above it (default: {ND_THRESHOLD_CM3:g})"
         ),
     )
     parser.add_argument(
