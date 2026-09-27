@@ -89,7 +89,6 @@ LAT_DIM = "lat"
 LON_DIM = "lon"
 
 ND_THRESHOLD_CM3 = 1.0
-MIN_LAYER_MEAN_ND = 1.0
 MIN_SIGMA_RMS = 1.0e-6
 H_THRESHOLD = 0.30
 MIN_INTEGRATION_LEVELS = 3
@@ -713,8 +712,9 @@ def _create_annual_output(path, year, lat, lon, nd_threshold, h_threshold):
     nc.setncattr("cloud_top_definition", "MODIS Cloud_Top_Pressure_Mean")
     nc.setncattr("nd_threshold_cm-3", float(nd_threshold))
     nc.setncattr("h_exceedance_threshold", float(h_threshold))
-    nc.setncattr("minimum_layer_mean_Nd_cm-3", float(MIN_LAYER_MEAN_ND))
     nc.setncattr("minimum_integration_levels", int(MIN_INTEGRATION_LEVELS))
+    nc.setncattr("H_validity", "at least 3 finite Nd model levels within bounds")
+    nc.setncattr("R_validity", "at least 3 model levels with finite paired Nd and sigmaNd within bounds")
     nc.setncattr("modis_variable", MODIS_VAR)
     nc.setncattr("modis_source", MODIS_SOURCE)
     nc.setncattr("algorithm_version", int(ALGORITHM_VERSION))
