@@ -36,44 +36,6 @@ Examples
 Optional:
     python Homogen_cloudthickness.py all --nd-threshold 1 --h-threshold 0.3
 """
-Daily cloud-thickness Nd heterogeneity using variable pressure bounds.
-
-For each daily NDnet grid column, define
-    Pbottom = lowermost pressure level with Nd > ND_THRESHOLD_CM3
-and use two alternative cloud-top pressures:
-    row 1: starting at Pbottom and moving upward, Ptop is the first finite
-           pressure level with Nd < ND_THRESHOLD_CM3
-    row 2: Ptop = MODIS Cloud_Top_Pressure_Mean
-
-Within [Ptop, Pbottom], all moments are integrated in ln(p), requiring at
-least three pressure nodes per integral:
-    <Nd> = integral Nd dlnp / Delta lnp
-    V = integral (Nd - <Nd>)^2 dlnp / Delta lnp
-    H = sqrt(V) / <Nd>
-    R = sqrt(V) / sqrt(<sigmaNd^2>)
-
-The 2 x 3 journal figure shows, for each Ptop definition:
-    median H (%), percent of valid days with H > H_THRESHOLD,
-    and median R.
-
-Daily H/R are written to annual intermediates so exact temporal medians can
-be calculated in spatial tiles without loading the full multi-year cube.
-
-MODIS source follows inference/config.py and inference/data_handling.py:
-    /panfs/ccds02/nobackup/people/dbarahon/NDnet/data/dailies/
-      MCD06COSP_D3_MODIS/on_Noutgrid/MCD06COSP_D3_MODIS.*YYYYMM*.nc
-Variable:
-    Cloud_Top_Pressure_Mean
-
-Examples
---------
-    python Homogen_cloudthickness.py compute
-    python Homogen_cloudthickness.py plot
-    python Homogen_cloudthickness.py all
-
-Optional:
-    python Homogen_cloudthickness.py all --nd-threshold 1 --h-threshold 0.3
-"""
 
 import argparse
 import glob
@@ -745,9 +707,17 @@ def _annual_file_is_current(path, nd_threshold, h_threshold):
         with Dataset(_quiet_path(path), "r") as nc:
             if "H" not in nc.variables or "R" not in nc.variables:
                 return False
+            if "top_method" in nc.dimensions:
+                return False
+            if nc.variables["H"].dimensions != (TIME_DIM, LAT_DIM, LON_DIM):
+                return False
+            if nc.variables["R"].dimensions != (TIME_DIM, LAT_DIM, LON_DIM):
+                return False
             if int(getattr(nc, "algorithm_version", -1)) != ALGORITHM_VERSION:
                 return False
-            if int(getattr(nc, "minimum_integration_levels", -1)) != MIN_INTEGRATION_LEVELS:
+            if int(
+                getattr(nc, "minimum_integration_levels", -1)
+            ) != MIN_INTEGRATION_LEVELS:
                 return False
             if not np.isclose(
                 float(getattr(nc, "nd_threshold_cm-3", np.nan)),
