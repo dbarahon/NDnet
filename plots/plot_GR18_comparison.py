@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
-GR18 vs NDnet-prior vs NDnet comparison.
+Journal-style comparison of NDnet with Grosvenor et al. (2018; GR18).
 
 Figure layout
 -------------
-(a) NDnet-prior multi-year annual mean
-(b) NDnet       multi-year annual mean
-(c) GR18        multi-year annual mean
-(d) NDnet-prior - GR18
-(e) NDnet       - GR18
-(f) Zonal means of the three annual-mean maps, with longitudinal IQR shading
+(a) NDnet multi-year annual mean
+(b) GR18  multi-year annual mean
+(c) NDnet - GR18
+(d) Zonal means of the two annual-mean maps, with longitudinal IQR shading
 
 Sampling / averaging
 --------------------
-* Only YYYYMM files available in ALL THREE archives are used.
+* Only YYYYMM files available in BOTH archives are used.
 * By default, only complete common years (all 12 months) are retained.
 * Each file is first averaged over its internal ``time`` dimension.
 * The resulting monthly means are averaged with equal weight. This avoids
   weighting NDnet by number of days while GR18 has a different internal time
   dimension.
 * NDnet fields are interpolated to the GR18 180x360 grid before comparison.
-* Difference maps are computed month-by-month on colocated finite pixels and
+* The difference map is computed month-by-month on colocated finite pixels and
   then averaged, rather than subtracting two independently sampled means.
 
 Outputs
@@ -34,7 +32,7 @@ from __future__ import annotations
 import re
 import warnings
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import xarray as xr
@@ -53,10 +51,6 @@ GR18_DIR = Path(
     "/panfs/ccds02/nobackup/people/dbarahon/NDnet/data/dailies/"
     "MODIS_ND_RETRIEVAL/Monthlies"
 )
-PRIOR_DIR = Path(
-    "/panfs/ccds02/nobackup/people/dbarahon/NDnet/EOF/inference/"
-    "NDnet_2D_monthly"
-)
 NDNET_DIR = Path(
     "/panfs/ccds02/nobackup/people/dbarahon/NDnet/EOF/inference/"
     "after_refinement/NDnet_2D_monthly"
@@ -73,14 +67,14 @@ START_YEAR = None
 END_YEAR = None
 
 # Recommended for a true annual climatology: keep only years for which all
-# 12 months exist in all three datasets.
+# 12 months exist in both datasets.
 COMPLETE_YEARS_ONLY = True
 
 # GR18 is 180x360 whereas NDnet is 181x360. Bilinear interpolation is the
 # default. Change to "nearest" if you want to avoid any spatial smoothing.
 REGRID_METHOD = "linear"
 
-# Plot limits. These are deliberately fixed for comparability across figures.
+# Plot limits. Fixed values make the two absolute-Nd panels directly comparable.
 ND_MIN = 0.0
 ND_MAX = 300.0
 ND_INTERVAL = 25.0
@@ -93,20 +87,6 @@ DIFF_CMAP = "RdBu_r"
 # Zonal variability envelope. "iqr" = 25th-75th percentile across longitude;
 # "std" = zonal mean +/- 1 standard deviation.
 ZONAL_SPREAD = "iqr"
-
-# Extra vertical whitespace between the two panel rows.  This is an explicit
-# spacer in the GridSpec, so increasing it does not push the colorbars away
-# from their associated panels.
-VERTICAL_GAP_RATIO = 0.18
-
-# Broken y axis for panel (f).  This keeps the ~100-300 cm-3 structure legible
-# while retaining the high-latitude NDnet-prior values that approach ~700.
-ZONAL_BROKEN_AXIS = True
-ZONAL_LOW_LIM = (0.0, 350.0)
-ZONAL_HIGH_LIM = (500.0, 750.0)
-# Relative heights of the upper and lower pieces of the broken axis.
-ZONAL_BREAK_HEIGHT_RATIOS = (1.0, 3.2)
-ZONAL_BREAK_HSPACE = 0.06
 
 OUTDIR = Path(".")
 OUT_BASENAME = "GR18_NDnet_comparison"
@@ -160,9 +140,10 @@ def discover_months(directory: Path, pattern: str) -> Dict[str, Path]:
 
 
 def select_common_months(
-    gr18: Dict[str, Path], prior: Dict[str, Path], ndnet: Dict[str, Path]
+    gr18: Dict[str, Path], ndnet: Dict[str, Path]
 ) -> list[str]:
-    common = sorted(set(gr18) & set(prior) & set(ndnet))
+    """Return common YYYYMM entries after optional period/year filtering."""
+    common = sorted(set(gr18) & set(ndnet))
 
     if START_YEAR is not None:
         common = [m for m in common if int(m[:4]) >= START_YEAR]
@@ -190,7 +171,6 @@ def canonicalize_latlon(da: xr.DataArray) -> xr.DataArray:
     """Return a 2-D field on increasing lat and [0, 360) increasing lon."""
     da = da.squeeze(drop=True)
     if set(da.dims) != {"lat", "lon"}:
-        # Permit dimension order differences, but no extra dimensions here.
         extra = [d for d in da.dims if d not in ("lat", "lon")]
         if extra:
             raise ValueError(f"Unexpected dimensions after time mean: {da.dims}")
@@ -232,7 +212,11 @@ def add_periodic_lon(da: xr.DataArray) -> xr.DataArray:
     return xr.concat([left, da, right], dim="lon").sortby("lon")
 
 
-def regrid_to(da: xr.DataArray, target_lat: np.ndarray, target_lon: np.ndarray) -> xr.DataArray:
+def regrid_to(
+    da: xr.DataArray,
+    target_lat: np.ndarray,
+    target_lon: np.ndarray,
+) -> xr.DataArray:
     """Interpolate to target lat/lon, treating longitude as periodic."""
     src = add_periodic_lon(da)
     out = src.interp(
@@ -339,39 +323,13 @@ def map_field(
     return mesh
 
 
-
-def add_broken_y_marks(ax_top, ax_bottom, size: float = 0.018) -> None:
-    """Draw diagonal break marks between two vertically stacked axes."""
-    kwargs_top = dict(
-        transform=ax_top.transAxes,
-        color="k",
-        clip_on=False,
-        linewidth=0.8,
-    )
-    kwargs_bottom = dict(
-        transform=ax_bottom.transAxes,
-        color="k",
-        clip_on=False,
-        linewidth=0.8,
-    )
-
-    # Bottom edge of upper axis.
-    ax_top.plot((-size, +size), (-size, +size), **kwargs_top)
-    ax_top.plot((1 - size, 1 + size), (-size, +size), **kwargs_top)
-
-    # Top edge of lower axis.
-    ax_bottom.plot((-size, +size), (1 - size, 1 + size), **kwargs_bottom)
-    ax_bottom.plot((1 - size, 1 + size), (1 - size, 1 + size), **kwargs_bottom)
-
-
 # =============================================================================
 # MAIN
 # =============================================================================
 def main() -> None:
     gr18_files = discover_months(GR18_DIR, GR18_GLOB)
-    prior_files = discover_months(PRIOR_DIR, NDNET_GLOB)
     ndnet_files = discover_months(NDNET_DIR, NDNET_GLOB)
-    months = select_common_months(gr18_files, prior_files, ndnet_files)
+    months = select_common_months(gr18_files, ndnet_files)
 
     years = sorted({int(m[:4]) for m in months})
     print(f"Using {len(months)} common months")
@@ -386,10 +344,8 @@ def main() -> None:
     shape = (target_lat.size, target_lon.size)
 
     acc_gr18 = MeanAccumulator(shape)
-    acc_prior = MeanAccumulator(shape)
     acc_ndnet = MeanAccumulator(shape)
-    acc_dprior = MeanAccumulator(shape)
-    acc_dndnet = MeanAccumulator(shape)
+    acc_diff = MeanAccumulator(shape)
 
     for i, yyyymm in enumerate(months, start=1):
         gr = load_monthly_mean(gr18_files[yyyymm], GR18_VAR)
@@ -403,241 +359,168 @@ def main() -> None:
         ):
             gr = regrid_to(gr, target_lat, target_lon)
 
-        prior = load_monthly_mean(prior_files[yyyymm], NDNET_VAR)
         ndnet = load_monthly_mean(ndnet_files[yyyymm], NDNET_VAR)
-        prior = regrid_to(prior, target_lat, target_lon)
         ndnet = regrid_to(ndnet, target_lat, target_lon)
 
         g = np.asarray(gr.values, dtype=float)
-        p = np.asarray(prior.values, dtype=float)
         n = np.asarray(ndnet.values, dtype=float)
 
         acc_gr18.add(g)
-        acc_prior.add(p)
         acc_ndnet.add(n)
 
-        # Colocated monthly differences. This is preferable to subtracting
-        # two climatologies with different valid-pixel masks.
-        vp = np.isfinite(p) & np.isfinite(g)
-        vn = np.isfinite(n) & np.isfinite(g)
-        acc_dprior.add(np.where(vp, p - g, np.nan))
-        acc_dndnet.add(np.where(vn, n - g, np.nan))
+        # Colocated monthly differences avoid subtracting climatologies with
+        # different valid-pixel masks.
+        valid = np.isfinite(n) & np.isfinite(g)
+        acc_diff.add(np.where(valid, n - g, np.nan))
 
         if i == 1 or i % 12 == 0 or i == len(months):
             print(f"  processed {i:4d}/{len(months)} months ({yyyymm})")
 
     mean_gr18 = acc_gr18.mean()
-    mean_prior = acc_prior.mean()
     mean_ndnet = acc_ndnet.mean()
-    diff_prior = acc_dprior.mean()
-    diff_ndnet = acc_dndnet.mean()
+    diff_ndnet = acc_diff.mean()
 
-    gm_prior = area_weighted_mean(mean_prior, target_lat)
     gm_ndnet = area_weighted_mean(mean_ndnet, target_lat)
     gm_gr18 = area_weighted_mean(mean_gr18, target_lat)
-    gm_dprior = area_weighted_mean(diff_prior, target_lat)
-    gm_dndnet = area_weighted_mean(diff_ndnet, target_lat)
+    gm_diff = area_weighted_mean(diff_ndnet, target_lat)
 
     print("\nArea-weighted means on the GR18 grid:")
-    print(f"  NDnet-prior : {gm_prior:8.3f} cm-3")
-    print(f"  NDnet       : {gm_ndnet:8.3f} cm-3")
-    print(f"  GR18        : {gm_gr18:8.3f} cm-3")
-    print(f"  Prior-GR18  : {gm_dprior:8.3f} cm-3")
-    print(f"  NDnet-GR18  : {gm_dndnet:8.3f} cm-3")
+    print(f"  NDnet      : {gm_ndnet:8.3f} cm-3")
+    print(f"  GR18       : {gm_gr18:8.3f} cm-3")
+    print(f"  NDnet-GR18 : {gm_diff:8.3f} cm-3")
 
     nd_bounds = np.arange(ND_MIN, ND_MAX + 0.5 * ND_INTERVAL, ND_INTERVAL)
-    d_bounds = np.arange(-DIFF_MAX, DIFF_MAX + 0.5 * DIFF_INTERVAL, DIFF_INTERVAL)
-    nd_norm = mcolors.BoundaryNorm(nd_bounds, ncolors=mpl.colormaps[ND_CMAP].N, clip=False)
-    d_norm = mcolors.BoundaryNorm(d_bounds, ncolors=mpl.colormaps[DIFF_CMAP].N, clip=False)
+    diff_bounds = np.arange(
+        -DIFF_MAX,
+        DIFF_MAX + 0.5 * DIFF_INTERVAL,
+        DIFF_INTERVAL,
+    )
+    nd_norm = mcolors.BoundaryNorm(
+        nd_bounds,
+        ncolors=mpl.colormaps[ND_CMAP].N,
+        clip=False,
+    )
+    diff_norm = mcolors.BoundaryNorm(
+        diff_bounds,
+        ncolors=mpl.colormaps[DIFF_CMAP].N,
+        clip=False,
+    )
 
-    fig = plt.figure(figsize=(11.8, 7.10))
-
-    # Five outer rows: top maps, their colorbar, an explicit whitespace row,
-    # bottom panels, and the difference colorbar.  VERTICAL_GAP_RATIO controls
-    # only the separation between the two panel rows.
-    outer = fig.add_gridspec(
-        nrows=5,
-        ncols=1,
-        height_ratios=[1.0, 0.045, VERTICAL_GAP_RATIO, 1.0, 0.045],
-        hspace=0.08,
-        left=0.045,
+    # Compact two-by-two journal layout. Colorbars occupy narrow rows below
+    # the panels and are not counted as figure panels.
+    fig = plt.figure(figsize=(8.2, 6.25))
+    gs = fig.add_gridspec(
+        nrows=4,
+        ncols=2,
+        height_ratios=[1.0, 0.055, 1.0, 0.055],
+        hspace=0.24,
+        wspace=0.16,
+        left=0.065,
         right=0.985,
-        bottom=0.070,
+        bottom=0.075,
         top=0.965,
     )
 
-    gs_top = outer[0].subgridspec(1, 3, wspace=0.08)
-    gs_bottom = outer[3].subgridspec(
-        1, 3,
-        width_ratios=[1.0, 1.0, 1.0],
-        wspace=0.20,
-    )
-    gs_diff_cb = outer[4].subgridspec(1, 3, wspace=0.20)
+    ax_a = fig.add_subplot(gs[0, 0], projection=MAP_PROJ)
+    ax_b = fig.add_subplot(gs[0, 1], projection=MAP_PROJ)
+    cax_nd = fig.add_subplot(gs[1, :])
 
-    ax_a = fig.add_subplot(gs_top[0, 0], projection=MAP_PROJ)
-    ax_b = fig.add_subplot(gs_top[0, 1], projection=MAP_PROJ)
-    ax_c = fig.add_subplot(gs_top[0, 2], projection=MAP_PROJ)
-    cax_top = fig.add_subplot(outer[1])
-
-    ax_d = fig.add_subplot(gs_bottom[0, 0], projection=MAP_PROJ)
-    ax_e = fig.add_subplot(gs_bottom[0, 1], projection=MAP_PROJ)
-
-    # Panel (f) can use a broken y axis so the dominant 100-300 cm-3 range
-    # remains expanded without discarding the ~700 cm-3 NDnet-prior tail.
-    if ZONAL_BROKEN_AXIS:
-        gs_zonal = gs_bottom[0, 2].subgridspec(
-            2,
-            1,
-            height_ratios=ZONAL_BREAK_HEIGHT_RATIOS,
-            hspace=ZONAL_BREAK_HSPACE,
-        )
-        ax_f_hi = fig.add_subplot(gs_zonal[0, 0])
-        ax_f_lo = fig.add_subplot(gs_zonal[1, 0], sharex=ax_f_hi)
-        zonal_axes = (ax_f_hi, ax_f_lo)
-    else:
-        ax_f_lo = fig.add_subplot(gs_bottom[0, 2])
-        ax_f_hi = None
-        zonal_axes = (ax_f_lo,)
-
-    cax_diff = fig.add_subplot(gs_diff_cb[0, 0:2])
-    ax_blank = fig.add_subplot(gs_diff_cb[0, 2])
-    ax_blank.axis("off")
+    ax_c = fig.add_subplot(gs[2, 0], projection=MAP_PROJ)
+    ax_d = fig.add_subplot(gs[2, 1])
+    cax_diff = fig.add_subplot(gs[3, 0])
+    ax_cbar_blank = fig.add_subplot(gs[3, 1])
+    ax_cbar_blank.axis("off")
 
     m_nd = map_field(
         ax_a,
         target_lon,
         target_lat,
-        mean_prior,
+        mean_ndnet,
         cmap=ND_CMAP,
         norm=nd_norm,
-        left_title="(a) NDnet-prior",
-        right_title=rf"$\overline{{N_d}}_A={gm_prior:.1f}$",
+        left_title="(a) NDnet",
+        right_title=rf"$\overline{{N_d}}_A={gm_ndnet:.1f}$",
     )
     map_field(
         ax_b,
         target_lon,
         target_lat,
-        mean_ndnet,
-        cmap=ND_CMAP,
-        norm=nd_norm,
-        left_title="(b) NDnet",
-        right_title=rf"$\overline{{N_d}}_A={gm_ndnet:.1f}$",
-    )
-    map_field(
-        ax_c,
-        target_lon,
-        target_lat,
         mean_gr18,
         cmap=ND_CMAP,
         norm=nd_norm,
-        left_title="(c) GR18",
+        left_title="(b) Grosvenor et al. (2018)",
         right_title=rf"$\overline{{N_d}}_A={gm_gr18:.1f}$",
     )
-
-    m_d = map_field(
-        ax_d,
-        target_lon,
-        target_lat,
-        diff_prior,
-        cmap=DIFF_CMAP,
-        norm=d_norm,
-        left_title="(d) NDnet-prior - GR18",
-        right_title=rf"$\overline{{\Delta N_d}}_A={gm_dprior:+.1f}$",
-    )
-    map_field(
-        ax_e,
+    m_diff = map_field(
+        ax_c,
         target_lon,
         target_lat,
         diff_ndnet,
         cmap=DIFF_CMAP,
-        norm=d_norm,
-        left_title="(e) NDnet - GR18",
-        right_title=rf"$\overline{{\Delta N_d}}_A={gm_dndnet:+.1f}$",
+        norm=diff_norm,
+        left_title="(c) NDnet - GR18",
+        right_title=rf"$\overline{{\Delta N_d}}_A={gm_diff:+.1f}$",
     )
 
-    # Shared color bars: one for all absolute-Nd panels and one for both biases.
-    cb1 = fig.colorbar(
+    cb_nd = fig.colorbar(
         m_nd,
-        cax=cax_top,
+        cax=cax_nd,
         orientation="horizontal",
         ticks=nd_bounds[::2],
         extend="max",
     )
-    cb1.set_label(r"$N_d$ (cm$^{-3}$)", labelpad=2)
-    cb1.ax.tick_params(length=2.5, pad=1.5)
+    cb_nd.set_label(r"$N_d$ (cm$^{-3}$)", labelpad=2)
+    cb_nd.ax.tick_params(length=2.5, pad=1.5)
 
-    cb2 = fig.colorbar(
-        m_d,
+    cb_diff = fig.colorbar(
+        m_diff,
         cax=cax_diff,
         orientation="horizontal",
-        ticks=d_bounds[::2],
+        ticks=diff_bounds[::2],
         extend="both",
     )
-    cb2.set_label(r"$\Delta N_d$ (cm$^{-3}$)", labelpad=2)
-    cb2.ax.tick_params(length=2.5, pad=1.5)
+    cb_diff.set_label(r"NDnet - GR18 (cm$^{-3}$)", labelpad=2)
+    cb_diff.ax.tick_params(length=2.5, pad=1.5)
 
-    # Zonal means + longitudinal variability of the annual-mean maps.
-    datasets = [
-        ("NDnet-prior", mean_prior, "tab:blue", "--", 1.45),
+    # Zonal means and longitudinal variability of the climatological maps.
+    zonal_cases = [
         ("NDnet", mean_ndnet, "tab:orange", "-", 1.55),
         ("GR18", mean_gr18, "0.15", "-", 1.45),
     ]
-    for label, field, color, ls, lw in datasets:
+    for label, field, color, ls, lw in zonal_cases:
         zmean, zlo, zhi = zonal_stats(field)
-        for ax in zonal_axes:
-            ax.fill_between(
-                target_lat, zlo, zhi, color=color, alpha=0.13, linewidth=0
-            )
-            ax.plot(target_lat, zmean, color=color, ls=ls, lw=lw, label=label)
+        ax_d.fill_between(
+            target_lat,
+            zlo,
+            zhi,
+            color=color,
+            alpha=0.13,
+            linewidth=0,
+        )
+        ax_d.plot(
+            target_lat,
+            zmean,
+            color=color,
+            ls=ls,
+            lw=lw,
+            label=label,
+        )
 
     spread_label = (
         "IQR across longitude"
         if ZONAL_SPREAD.lower() == "iqr"
         else r"$\pm1\sigma$ across longitude"
     )
-
-    # Common x formatting for either a normal or broken zonal axis.
-    for ax in zonal_axes:
-        ax.set_xlim(-90, 90)
-        ax.set_xticks(np.arange(-90, 91, 30))
-        ax.grid(True, which="major", linewidth=0.35, alpha=0.35, linestyle=":")
-        ax.tick_params(direction="out", right=True)
-
-    if ZONAL_BROKEN_AXIS:
-        ax_f_lo.set_ylim(*ZONAL_LOW_LIM)
-        ax_f_hi.set_ylim(*ZONAL_HIGH_LIM)
-
-        # Hide the adjoining spines/ticks and add conventional diagonal marks.
-        ax_f_hi.spines["bottom"].set_visible(False)
-        ax_f_lo.spines["top"].set_visible(False)
-        ax_f_hi.tick_params(
-            axis="x", bottom=False, labelbottom=False, top=True, labeltop=False
-        )
-        ax_f_lo.tick_params(axis="x", top=False, bottom=True)
-        add_broken_y_marks(ax_f_hi, ax_f_lo)
-
-        ax_f_hi.set_title(
-            "(f) Zonal mean", loc="left", pad=3.0, fontweight="bold"
-        )
-        ax_f_hi.set_title(spread_label, loc="right", pad=3.0, fontsize=7.5)
-        ax_f_lo.set_xlabel("Latitude (deg)")
-        ax_f_lo.set_ylabel(r"$N_d$ (cm$^{-3}$)")
-
-        # Put the legend in the upper segment; it uses the same artists but
-        # does not obscure the main 100-300 cm-3 structure in the lower axis.
-        ax_f_hi.legend(
-            frameon=False, loc="upper center", ncol=3, handlelength=2.0,
-            columnspacing=0.9, borderaxespad=0.2
-        )
-    else:
-        ax_f_lo.set_title(
-            "(f) Zonal mean", loc="left", pad=3.0, fontweight="bold"
-        )
-        ax_f_lo.set_title(spread_label, loc="right", pad=3.0, fontsize=7.5)
-        ax_f_lo.set_xlabel("Latitude (deg)")
-        ax_f_lo.set_ylabel(r"$N_d$ (cm$^{-3}$)")
-        ax_f_lo.set_ylim(bottom=0)
-        ax_f_lo.legend(frameon=False, loc="upper right", handlelength=2.4)
+    ax_d.set_xlim(-90, 90)
+    ax_d.set_xticks(np.arange(-90, 91, 30))
+    ax_d.set_ylim(bottom=0)
+    ax_d.grid(True, which="major", linewidth=0.35, alpha=0.35, linestyle=":")
+    ax_d.tick_params(direction="out", right=True)
+    ax_d.set_xlabel("Latitude (deg)")
+    ax_d.set_ylabel(r"$N_d$ (cm$^{-3}$)")
+    ax_d.set_title("(d) Zonal mean", loc="left", pad=3.0, fontweight="bold")
+    ax_d.set_title(spread_label, loc="right", pad=3.0, fontsize=7.5)
+    ax_d.legend(frameon=False, loc="upper right", handlelength=2.4)
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
     png = OUTDIR / f"{OUT_BASENAME}.png"
