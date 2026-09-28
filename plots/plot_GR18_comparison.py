@@ -18,6 +18,8 @@ Sampling / averaging
   weighting NDnet by number of days while GR18 has a different internal time
   dimension.
 * NDnet fields are interpolated to the GR18 180x360 grid before comparison.
+  An optional NaN-surviving mode renormalizes linear interpolation over the
+  finite source neighbors instead of allowing one NaN corner to mask the target.
 * The difference map is computed month-by-month on colocated finite pixels and
   then averaged, rather than subtracting two independently sampled means.
 
@@ -29,6 +31,7 @@ GR18_NDnet_comparison.pdf
 
 from __future__ import annotations
 
+import argparse
 import re
 import warnings
 from pathlib import Path
@@ -73,6 +76,12 @@ COMPLETE_YEARS_ONLY = True
 # GR18 is 180x360 whereas NDnet is 181x360. Bilinear interpolation is the
 # default. Change to "nearest" if you want to avoid any spatial smoothing.
 REGRID_METHOD = "linear"
+
+# If True, linear regridding ignores missing source neighbors and renormalizes
+# the interpolation weights over the remaining finite values. If False, use
+# xarray's standard interpolation, where a NaN source corner can yield NaN at
+# the target point. This can also be overridden with --nan-surviving-regrid.
+NAN_SURVIVING_REGRID = False
 
 # Plot limits. Fixed values make the two absolute-Nd panels directly comparable.
 ND_MIN = 0.0
@@ -216,14 +225,30 @@ def regrid_to(
     da: xr.DataArray,
     target_lat: np.ndarray,
     target_lon: np.ndarray,
+    *,
+    nan_surviving: bool = NAN_SURVIVING_REGRID,
 ) -> xr.DataArray:
-    """Interpolate to target lat/lon, treating longitude as periodic."""
+    """Interpolate to target lat/lon, treating longitude as periodic.
+
+    In NaN-surviving mode, interpolate the zero-filled field and a finite-data
+    mask separately, then divide by the interpolated mask. This renormalizes
+    the linear weights over finite source neighbors, so a single NaN corner
+    does not automatically make the target grid cell NaN.
+    """
     src = add_periodic_lon(da)
-    out = src.interp(
-        lat=xr.DataArray(target_lat, dims="lat"),
-        lon=xr.DataArray(target_lon, dims="lon"),
-        method=REGRID_METHOD,
-    )
+    target = {
+        "lat": xr.DataArray(target_lat, dims="lat"),
+        "lon": xr.DataArray(target_lon, dims="lon"),
+    }
+
+    if nan_surviving and REGRID_METHOD == "linear":
+        finite = xr.where(np.isfinite(src), 1.0, 0.0)
+        numerator = src.fillna(0.0).interp(method=REGRID_METHOD, **target)
+        weight = finite.interp(method=REGRID_METHOD, **target)
+        out = (numerator / weight).where(weight > 1.0e-12)
+    else:
+        out = src.interp(method=REGRID_METHOD, **target)
+
     return out.transpose("lat", "lon")
 
 
@@ -326,7 +351,7 @@ def map_field(
 # =============================================================================
 # MAIN
 # =============================================================================
-def main() -> None:
+def main(nan_surviving_regrid: bool = NAN_SURVIVING_REGRID) -> None:
     gr18_files = discover_months(GR18_DIR, GR18_GLOB)
     ndnet_files = discover_months(NDNET_DIR, NDNET_GLOB)
     months = select_common_months(gr18_files, ndnet_files)
@@ -336,6 +361,10 @@ def main() -> None:
     print(f"Years: {years[0]}-{years[-1]} ({len(years)} years)")
     if COMPLETE_YEARS_ONLY:
         print("Complete common years only: yes")
+    print(
+        "NaN-surviving linear regridding: "
+        f"{'yes' if nan_surviving_regrid else 'no'}"
+    )
 
     # First GR18 month defines the common comparison grid.
     gr0 = load_monthly_mean(gr18_files[months[0]], GR18_VAR)
@@ -357,10 +386,20 @@ def main() -> None:
             or not np.allclose(gr.lat.values, target_lat)
             or not np.allclose(gr.lon.values, target_lon)
         ):
-            gr = regrid_to(gr, target_lat, target_lon)
+            gr = regrid_to(
+                gr,
+                target_lat,
+                target_lon,
+                nan_surviving=nan_surviving_regrid,
+            )
 
         ndnet = load_monthly_mean(ndnet_files[yyyymm], NDNET_VAR)
-        ndnet = regrid_to(ndnet, target_lat, target_lon)
+        ndnet = regrid_to(
+            ndnet,
+            target_lat,
+            target_lon,
+            nan_surviving=nan_surviving_regrid,
+        )
 
         g = np.asarray(gr.values, dtype=float)
         n = np.asarray(ndnet.values, dtype=float)
@@ -532,5 +571,23 @@ def main() -> None:
     print(f"\nSaved:\n  {png}\n  {pdf}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compare NDnet with Grosvenor et al. (2018)."
+    )
+    parser.add_argument(
+        "--nan-surviving-regrid",
+        action=argparse.BooleanOptionalAction,
+        default=NAN_SURVIVING_REGRID,
+        help=(
+            "Renormalize linear interpolation over finite source neighbors "
+            "(default: %(default)s). Use --no-nan-surviving-regrid for "
+            "standard xarray NaN propagation."
+        ),
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(nan_surviving_regrid=args.nan_surviving_regrid)
