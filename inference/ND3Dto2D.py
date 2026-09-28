@@ -39,6 +39,14 @@ liquid-mass-weighted sigma diagnostics:
       Propagated integrated uncertainty of the weighted-column value, computed
       as sqrt(sum((w_i * sigma_i)^2)) / sum(w_i).
 
+Interpolation
+-------------
+Continuous GiOcean ancillary fields (QL, H, T, and SWCLDTMP) are interpolated
+to the NDnet grid with NaN-surviving, finite-weight renormalization by default.
+This avoids artificial NaN halos from ordinary linear interpolation. MODIS COD
+and cloud-fraction retrieval fields preserve NaNs because missing retrievals are
+part of the comparison mask.
+
 This version writes one NetCDF file per month, with an unlimited time dimension
 inside each monthly file. It appends one day at a time to the current month file,
 so it avoids both thousands of daily outputs and one very large slow full-period
@@ -117,6 +125,11 @@ DEFAULT_END_MONTH = None    # e.g., "202512"
 # For shared filesystems, 4 is usually a safer default than using all cores.
 DEFAULT_WORKERS = 24
 DEFAULT_VERBOSE_DAYS = False
+# NaN-surviving interpolation for continuous GiOcean ancillary fields.
+# Linear interpolation is performed on the zero-filled field and on a finite
+# data mask, then renormalized by the interpolated finite-data weight. MODIS
+# retrieval fields are intentionally excluded because NaN denotes no retrieval.
+DEFAULT_NAN_SURVIVING_INTERP = True
 
 
 @dataclass
@@ -255,6 +268,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_VERBOSE_DAYS,
         help="Print one progress line per appended day. By default, only monthly summaries are printed.",
     )
+    p.add_argument(
+        "--nan-surviving-interp",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_NAN_SURVIVING_INTERP,
+        help=(
+            "For continuous GiOcean ancillary fields, renormalize linear "
+            "interpolation over finite source values so neighboring NaNs do "
+            "not unnecessarily mask target cells. MODIS retrieval fields "
+            "always preserve NaNs because they define the valid-retrieval mask. "
+            "(default: %(default)s)"
+        ),
+    )
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
@@ -327,7 +352,19 @@ def interp_to_ndnet_grid(
     nd_lev: Optional[xr.DataArray],
     nd_lat: xr.DataArray,
     nd_lon: xr.DataArray,
+    *,
+    nan_surviving: bool = False,
 ) -> xr.DataArray:
+    """Interpolate one field to the NDnet grid.
+
+    When nan_surviving is True, linear interpolation is renormalized over
+    finite source values. This prevents a single NaN source neighbor from
+    making an otherwise supported target value NaN. The method does not
+    extrapolate outside the source coordinate range.
+
+    Keep this False for MODIS retrieval/mask fields: their NaNs are meaningful
+    and identify locations without a valid retrieval.
+    """
     out = normalize_longitudes(da, nd_lon)
     interp_kwargs = {}
     if "lev" in out.dims and nd_lev is not None:
@@ -336,9 +373,22 @@ def interp_to_ndnet_grid(
         interp_kwargs["lat"] = nd_lat
     if "lon" in out.dims:
         interp_kwargs["lon"] = nd_lon
-    if interp_kwargs:
-        out = out.interp(**interp_kwargs)
-    return out
+
+    if not interp_kwargs:
+        return out
+
+    if not nan_surviving:
+        return out.interp(**interp_kwargs)
+
+    attrs = out.attrs.copy()
+    name = out.name
+    finite = xr.where(np.isfinite(out), 1.0, 0.0)
+    numerator = out.fillna(0.0).interp(**interp_kwargs)
+    support = finite.interp(**interp_kwargs)
+    result = (numerator / support).where(support > 1.0e-12)
+    result.attrs.update(attrs)
+    result.name = name
+    return result
 
 
 def restrict_to_pressure_range(
@@ -522,12 +572,33 @@ def process_one_day(ndnet_path: str, cache: MonthCache, args: argparse.Namespace
         gio_sfc_day = sel_day(entry.sfc, day)
         modis_day = sel_day(entry.modis, day)
 
-        ql = interp_to_ndnet_grid(gio_atm_day[QL_VAR], nd_lev, nd_lat, nd_lon)
-        h = interp_to_ndnet_grid(gio_atm_day[H_VAR], nd_lev, nd_lat, nd_lon)
-        temp = interp_to_ndnet_grid(gio_atm_day[T_VAR], nd_lev, nd_lat, nd_lon)
-        ctt = interp_to_ndnet_grid(gio_sfc_day[CTT_VAR], None, nd_lat, nd_lon)
-        modis_cod = interp_to_ndnet_grid(modis_day[MODIS_MASK_VAR], None, nd_lat, nd_lon)
-        modis_cf = interp_to_ndnet_grid(modis_day[MODIS_CF_VAR], None, nd_lat, nd_lon)
+        # Continuous GiOcean fields use optional NaN-surviving interpolation.
+        # MODIS retrieval fields intentionally preserve NaNs because those NaNs
+        # are part of the valid-retrieval / track definition.
+        ql = interp_to_ndnet_grid(
+            gio_atm_day[QL_VAR], nd_lev, nd_lat, nd_lon,
+            nan_surviving=args.nan_surviving_interp,
+        )
+        h = interp_to_ndnet_grid(
+            gio_atm_day[H_VAR], nd_lev, nd_lat, nd_lon,
+            nan_surviving=args.nan_surviving_interp,
+        )
+        temp = interp_to_ndnet_grid(
+            gio_atm_day[T_VAR], nd_lev, nd_lat, nd_lon,
+            nan_surviving=args.nan_surviving_interp,
+        )
+        ctt = interp_to_ndnet_grid(
+            gio_sfc_day[CTT_VAR], None, nd_lat, nd_lon,
+            nan_surviving=args.nan_surviving_interp,
+        )
+        modis_cod = interp_to_ndnet_grid(
+            modis_day[MODIS_MASK_VAR], None, nd_lat, nd_lon,
+            nan_surviving=False,
+        )
+        modis_cf = interp_to_ndnet_grid(
+            modis_day[MODIS_CF_VAR], None, nd_lat, nd_lon,
+            nan_surviving=False,
+        )
 
         dz = approximate_layer_thickness(h)
         rho = air_density_from_temperature(temp, nd_lev)
@@ -699,6 +770,12 @@ def process_one_day(ndnet_path: str, cache: MonthCache, args: argparse.Namespace
                 "unweighted_vertical_collapse": "arithmetic mean over finite NDnet levels in selected pressure range",
                 "rho_definition": "rho_air = p / (Rd * T), with p from NDnet/GiOcean lev in hPa and T from GiOcean T",
                 "dz_definition": "approximate absolute layer thickness derived from GiOcean H on selected NDnet levels",
+                "nan_surviving_interpolation": (
+                    "enabled for GiOcean QL, H, T, and SWCLDTMP; "
+                    "MODIS retrieval fields preserve NaNs"
+                    if args.nan_surviving_interp
+                    else "disabled"
+                ),
                 "modis_track_definition": (
                     f"finite {MODIS_MASK_VAR}"
                     if args.min_cod is None or not np.isfinite(args.min_cod)
@@ -943,7 +1020,9 @@ def main() -> None:
 
     print(
         f"[START] processing {nmonths} month(s) with {workers} worker(s); "
-        f"output directory: {args.out_dir}",
+        f"output directory: {args.out_dir}; "
+        f"NaN-surviving GiOcean interpolation: "
+        f"{'on' if args.nan_surviving_interp else 'off'}",
         flush=True,
     )
 
