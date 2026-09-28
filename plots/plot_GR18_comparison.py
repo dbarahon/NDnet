@@ -109,6 +109,12 @@ HATCH_MIN_MONTHS = 12
 HATCH_PATTERN = "/"
 HATCH_LINEWIDTH = 0.35
 
+# Figure spacing controls.
+# ROW_GAP_RATIO inserts explicit whitespace between the two panel rows.
+# ZONAL_TOP_PAD_RATIO lowers panel (d) slightly relative to panel (c).
+ROW_GAP_RATIO = 0.12
+ZONAL_TOP_PAD_RATIO = 0.08
+
 OUTDIR = Path(".")
 OUT_BASENAME = "GR18_NDnet_comparison"
 DPI = 400
@@ -514,13 +520,14 @@ def main(nan_surviving_regrid: bool = NAN_SURVIVING_REGRID) -> None:
     )
 
     # Compact two-by-two journal layout. Colorbars occupy narrow rows below
-    # the panels and are not counted as figure panels.
-    fig = plt.figure(figsize=(8.2, 6.25))
+    # the panels and are not counted as figure panels. An explicit spacer row
+    # controls the separation between the two panel rows.
+    fig = plt.figure(figsize=(8.2, 6.45))
     gs = fig.add_gridspec(
-        nrows=4,
+        nrows=5,
         ncols=2,
-        height_ratios=[1.0, 0.055, 1.0, 0.055],
-        hspace=0.24,
+        height_ratios=[1.0, 0.055, ROW_GAP_RATIO, 1.0, 0.055],
+        hspace=0.14,
         wspace=0.16,
         left=0.065,
         right=0.985,
@@ -532,10 +539,19 @@ def main(nan_surviving_regrid: bool = NAN_SURVIVING_REGRID) -> None:
     ax_b = fig.add_subplot(gs[0, 1], projection=MAP_PROJ)
     cax_nd = fig.add_subplot(gs[1, :])
 
-    ax_c = fig.add_subplot(gs[2, 0], projection=MAP_PROJ)
-    ax_d = fig.add_subplot(gs[2, 1])
-    cax_diff = fig.add_subplot(gs[3, 0])
-    ax_cbar_blank = fig.add_subplot(gs[3, 1])
+    ax_c = fig.add_subplot(gs[3, 0], projection=MAP_PROJ)
+
+    # Lower the zonal-mean panel slightly without moving panel (c).
+    gs_zonal = gs[3, 1].subgridspec(
+        2,
+        1,
+        height_ratios=[ZONAL_TOP_PAD_RATIO, 1.0],
+        hspace=0.0,
+    )
+    ax_d = fig.add_subplot(gs_zonal[1, 0])
+
+    cax_diff = fig.add_subplot(gs[4, 0])
+    ax_cbar_blank = fig.add_subplot(gs[4, 1])
     ax_cbar_blank.axis("off")
 
     m_nd = map_field(
