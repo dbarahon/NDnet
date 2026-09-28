@@ -22,6 +22,8 @@ Sampling / averaging
   finite source neighbors instead of allowing one NaN corner to mask the target.
 * The difference map is computed month-by-month on colocated finite pixels and
   then averaged, rather than subtracting two independently sampled means.
+* Panel (c) optionally hatches grid cells where the mean monthly difference
+  exceeds a configurable multiple of its standard error (2 SE by default).
 
 Outputs
 -------
@@ -96,6 +98,15 @@ DIFF_CMAP = "RdBu_r"
 # Zonal variability envelope. "iqr" = 25th-75th percentile across longitude;
 # "std" = zonal mean +/- 1 standard deviation.
 ZONAL_SPREAD = "iqr"
+
+# Hatching on panel (c). The monthly colocated NDnet-GR18 differences are used
+# to estimate the sample standard error of the mean at every grid cell. Hatch
+# where |mean difference| exceeds HATCH_SE_MULTIPLIER * SE and there are at
+# least HATCH_MIN_MONTHS valid monthly pairs.
+SHOW_HATCHING = True
+HATCH_SE_MULTIPLIER = 2.0
+HATCH_MIN_MONTHS = 12
+HATCH_PATTERN = "////"
 
 OUTDIR = Path(".")
 OUT_BASENAME = "GR18_NDnet_comparison"
@@ -271,6 +282,43 @@ class MeanAccumulator:
         return out
 
 
+class MeanSEAccumulator:
+    """NaN-aware online mean and standard error for a fixed 2-D grid."""
+
+    def __init__(self, shape: Tuple[int, int]):
+        self.sum = np.zeros(shape, dtype=np.float64)
+        self.sumsq = np.zeros(shape, dtype=np.float64)
+        self.count = np.zeros(shape, dtype=np.int32)
+
+    def add(self, arr: np.ndarray) -> None:
+        arr = np.asarray(arr, dtype=np.float64)
+        valid = np.isfinite(arr)
+        values = arr[valid]
+        self.sum[valid] += values
+        self.sumsq[valid] += values * values
+        self.count[valid] += 1
+
+    def mean(self) -> np.ndarray:
+        out = np.full(self.sum.shape, np.nan, dtype=np.float64)
+        np.divide(self.sum, self.count, out=out, where=self.count > 0)
+        return out
+
+    def standard_error(self) -> np.ndarray:
+        """Return sample standard deviation / sqrt(N), requiring N >= 2."""
+        out = np.full(self.sum.shape, np.nan, dtype=np.float64)
+        valid = self.count >= 2
+        if not np.any(valid):
+            return out
+
+        n = self.count[valid].astype(np.float64)
+        # Numerically stable sample variance from sum and sum of squares.
+        ss = self.sumsq[valid] - (self.sum[valid] ** 2) / n
+        ss = np.maximum(ss, 0.0)
+        sample_var = ss / (n - 1.0)
+        out[valid] = np.sqrt(sample_var / n)
+        return out
+
+
 def area_weighted_mean(field: np.ndarray, lat: np.ndarray) -> float:
     """Cos(latitude)-weighted mean over all finite grid cells."""
     field = np.asarray(field, dtype=float)
@@ -374,7 +422,7 @@ def main(nan_surviving_regrid: bool = NAN_SURVIVING_REGRID) -> None:
 
     acc_gr18 = MeanAccumulator(shape)
     acc_ndnet = MeanAccumulator(shape)
-    acc_diff = MeanAccumulator(shape)
+    acc_diff = MeanSEAccumulator(shape)
 
     for i, yyyymm in enumerate(months, start=1):
         gr = load_monthly_mean(gr18_files[yyyymm], GR18_VAR)
@@ -408,9 +456,11 @@ def main(nan_surviving_regrid: bool = NAN_SURVIVING_REGRID) -> None:
         acc_ndnet.add(n)
 
         # Colocated monthly differences avoid subtracting climatologies with
-        # different valid-pixel masks.
+        # different valid-pixel masks. The same monthly differences are also
+        # used to estimate the standard error for panel-(c) hatching.
         valid = np.isfinite(n) & np.isfinite(g)
-        acc_diff.add(np.where(valid, n - g, np.nan))
+        monthly_diff = np.where(valid, n - g, np.nan)
+        acc_diff.add(monthly_diff)
 
         if i == 1 or i % 12 == 0 or i == len(months):
             print(f"  processed {i:4d}/{len(months)} months ({yyyymm})")
@@ -418,6 +468,8 @@ def main(nan_surviving_regrid: bool = NAN_SURVIVING_REGRID) -> None:
     mean_gr18 = acc_gr18.mean()
     mean_ndnet = acc_ndnet.mean()
     diff_ndnet = acc_diff.mean()
+    diff_se = acc_diff.standard_error()
+    diff_n = acc_diff.count.copy()
 
     gm_ndnet = area_weighted_mean(mean_ndnet, target_lat)
     gm_gr18 = area_weighted_mean(mean_gr18, target_lat)
@@ -427,6 +479,21 @@ def main(nan_surviving_regrid: bool = NAN_SURVIVING_REGRID) -> None:
     print(f"  NDnet      : {gm_ndnet:8.3f} cm-3")
     print(f"  GR18       : {gm_gr18:8.3f} cm-3")
     print(f"  NDnet-GR18 : {gm_diff:8.3f} cm-3")
+    if SHOW_HATCHING:
+        hatch_valid = np.isfinite(diff_se) & (diff_n >= HATCH_MIN_MONTHS)
+        hatch_sig = hatch_valid & (
+            np.abs(diff_ndnet) > HATCH_SE_MULTIPLIER * diff_se
+        )
+        n_hatch = int(np.count_nonzero(hatch_sig))
+        n_tested = int(np.count_nonzero(hatch_valid))
+        print(
+            "  Hatching    : "
+            f"|mean difference| > {HATCH_SE_MULTIPLIER:g} SE, "
+            f"N >= {HATCH_MIN_MONTHS}; "
+            f"{n_hatch}/{n_tested} tested grid cells hatched"
+        )
+    else:
+        hatch_sig = None
 
     nd_bounds = np.arange(ND_MIN, ND_MAX + 0.5 * ND_INTERVAL, ND_INTERVAL)
     diff_bounds = np.arange(
@@ -500,6 +567,38 @@ def main(nan_surviving_regrid: bool = NAN_SURVIVING_REGRID) -> None:
         left_title="(c) NDnet - GR18",
         right_title=rf"$\overline{{\Delta N_d}}_A={gm_diff:+.1f}$",
     )
+
+    if SHOW_HATCHING and hatch_sig is not None:
+        # Hatch cells where the mean monthly difference is large relative to
+        # its sampling uncertainty. This is a 2-SE-style robustness screen,
+        # not a formal autocorrelation-adjusted hypothesis test.
+        hatch_field = np.where(hatch_sig, 1.0, np.nan)
+        hatch_cyclic, hatch_lon = add_cyclic_point(
+            hatch_field,
+            coord=target_lon,
+            axis=1,
+        )
+        ax_c.contourf(
+            hatch_lon,
+            target_lat,
+            hatch_cyclic,
+            levels=[0.5, 1.5],
+            colors="none",
+            hatches=[HATCH_PATTERN],
+            transform=DATA_CRS,
+            zorder=3,
+        )
+        ax_c.text(
+            0.02,
+            0.03,
+            rf"Hatched: $|\overline{{\Delta N_d}}|>{HATCH_SE_MULTIPLIER:g}\,SE$",
+            transform=ax_c.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=6.5,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 1.2},
+            zorder=4,
+        )
 
     cb_nd = fig.colorbar(
         m_nd,
