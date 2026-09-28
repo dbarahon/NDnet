@@ -106,7 +106,8 @@ ZONAL_SPREAD = "iqr"
 SHOW_HATCHING = True
 HATCH_SE_MULTIPLIER = 2.0
 HATCH_MIN_MONTHS = 12
-HATCH_PATTERN = "////"
+HATCH_PATTERN = "/"
+HATCH_LINEWIDTH = 0.35
 
 OUTDIR = Path(".")
 OUT_BASENAME = "GR18_NDnet_comparison"
@@ -572,6 +573,7 @@ def main(nan_surviving_regrid: bool = NAN_SURVIVING_REGRID) -> None:
         # Hatch cells where the mean monthly difference is large relative to
         # its sampling uncertainty. This is a 2-SE-style robustness screen,
         # not a formal autocorrelation-adjusted hypothesis test.
+        mpl.rcParams["hatch.linewidth"] = HATCH_LINEWIDTH
         hatch_field = np.where(hatch_sig, 1.0, np.nan)
         hatch_cyclic, hatch_lon = add_cyclic_point(
             hatch_field,
@@ -588,18 +590,6 @@ def main(nan_surviving_regrid: bool = NAN_SURVIVING_REGRID) -> None:
             transform=DATA_CRS,
             zorder=3,
         )
-        ax_c.text(
-            0.02,
-            0.03,
-            rf"Hatched: $|\overline{{\Delta N_d}}|>{HATCH_SE_MULTIPLIER:g}\,SE$",
-            transform=ax_c.transAxes,
-            ha="left",
-            va="bottom",
-            fontsize=6.5,
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 1.2},
-            zorder=4,
-        )
-
     cb_nd = fig.colorbar(
         m_nd,
         cax=cax_nd,
