@@ -872,14 +872,17 @@ def plot_campaign_nd_timeseries(
     min_nd_compare=1.0,
     use_modis_mask=False,
     daily_mean=False,
+    daily_mean_correlation=False,
     ylim=ND_LIM,
 ):
     """
     Campaign-wise Nd time series.
 
-    Correlations are always computed from the individual accepted segments.
-    daily_mean=True changes only the displayed time series: accepted segments
-    are averaged within each campaign day for visual clarity.
+    Segment-level correlations are always computed from the individual
+    accepted segments. daily_mean=True changes only the displayed time series:
+    accepted segments are averaged within each campaign day for visual clarity.
+    daily_mean_correlation=True additionally computes correlation from the
+    paired daily means, without replacing the segment-level correlation.
 
     The NN/observation points use the same pair screening as the campaign Nd
     scatter: finite pairs, optional positivity for log plotting, the observed
@@ -1037,6 +1040,43 @@ def plot_campaign_nd_timeseries(
             r_b = np.nan
             n_b = 0
 
+        r_n_day = np.nan
+        r_b_day = np.nan
+
+        if daily_mean_correlation:
+            daily_nn = (
+                sub_nn.groupby(
+                    "_campaign_day",
+                    as_index=False,
+                    sort=True,
+                )[[obs_col, nn_col]]
+                .mean()
+            )
+
+            r_n_day, _, _, _ = (
+                _campaign_compute_stats(
+                    daily_nn[obs_col].values,
+                    daily_nn[nn_col].values,
+                )
+            )
+
+            if sub_base is not None and not sub_base.empty:
+                daily_base = (
+                    sub_base.groupby(
+                        "_campaign_day",
+                        as_index=False,
+                        sort=True,
+                    )[[obs_col, base_col]]
+                    .mean()
+                )
+
+                r_b_day, _, _, _ = (
+                    _campaign_compute_stats(
+                        daily_base[obs_col].values,
+                        daily_base[base_col].values,
+                    )
+                )
+
         rtxt_n = (
             "--"
             if not np.isfinite(r_n)
@@ -1048,10 +1088,36 @@ def plot_campaign_nd_timeseries(
             else f"{r_b:.2f}"
         )
 
+        if daily_mean_correlation:
+            rtxt_n_day = (
+                "--"
+                if not np.isfinite(r_n_day)
+                else f"{r_n_day:.2f}"
+            )
+            rtxt_b_day = (
+                "--"
+                if not np.isfinite(r_b_day)
+                else f"{r_b_day:.2f}"
+            )
+
+            stat_title = (
+                rf"NN: $r_{{seg}}$={rtxt_n}, "
+                rf"$r_{{day}}$={rtxt_n_day}"
+                "\n"
+                rf"Base: $r_{{seg}}$={rtxt_b}, "
+                rf"$r_{{day}}$={rtxt_b_day}"
+            )
+            stat_fontsize = 7.2
+        else:
+            stat_title = (
+                rf"NN $r$={rtxt_n}  Base $r$={rtxt_b}"
+            )
+            stat_fontsize = 7.7
+
         ax.set_title(
-            rf"NN $r$={rtxt_n}  Base $r$={rtxt_b}",
+            stat_title,
             loc="right",
-            fontsize=7.7,
+            fontsize=stat_fontsize,
             pad=5,
         )
 
@@ -2121,7 +2187,17 @@ def main():
         action="store_true",
         help=(
             "Plot one mean Nd value per campaign day in the Nd time-series "
-            "figure. Correlations remain segment-level."
+            "figure. Correlations remain segment-level unless daily-mean "
+            "correlation is also requested."
+        ),
+    )
+
+    parser.add_argument(
+        "--daily-mean-correlation",
+        action="store_true",
+        help=(
+            "Also calculate and display Nd correlation from campaign-day "
+            "means for NDnet and Base. Segment-level correlations are kept."
         ),
     )
 
@@ -2191,6 +2267,7 @@ def main():
         min_nd_compare=args.min_nd,
         use_modis_mask=args.modis_mask,
         daily_mean=args.daily_mean_nd_timeseries,
+        daily_mean_correlation=args.daily_mean_correlation,
     )
 
     # --------------------------------------------------------
