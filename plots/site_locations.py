@@ -359,7 +359,7 @@ def plot_sites(sites, output, dpi=DPI):
         projection=proj,
     )
     ax_eu = fig.add_axes(
-        [0.515, 0.12, 0.275, 0.79],
+        [0.535, 0.12, 0.245, 0.79],
         projection=proj,
     )
 
@@ -378,13 +378,6 @@ def plot_sites(sites, output, dpi=DPI):
         proj,
     )
     plot_site_symbols(ax_full, sites, proj, markersize=5.0)
-
-    ax_full.set_title(
-        "(a) Canonical site network",
-        loc="left",
-        fontsize=7.5,
-        pad=3.0,
-    )
 
     # Show exactly what geographic region is magnified in panel (b).
     zoom_box = Rectangle(
@@ -422,14 +415,18 @@ def plot_sites(sites, output, dpi=DPI):
         EU_LAT_TICKS,
         proj,
     )
-    plot_site_symbols(ax_eu, eu_sites, proj, markersize=5.3)
-
-    ax_eu.set_title(
-        "(b) European zoom",
-        loc="left",
-        fontsize=7.5,
-        pad=3.0,
+    # Put the zoom latitude labels on the outside edge so they do not
+    # occupy the gap between the two map panels.
+    ax_eu.yaxis.tick_right()
+    ax_eu.tick_params(
+        axis="y",
+        left=False,
+        labelleft=False,
+        right=True,
+        labelright=True,
+        pad=1.5,
     )
+    plot_site_symbols(ax_eu, eu_sites, proj, markersize=5.3)
 
     # -----------------------------------------------------------------
     # External legend
@@ -438,7 +435,7 @@ def plot_sites(sites, output, dpi=DPI):
     legend = fig.legend(
         handles=legend_handles,
         loc="center left",
-        bbox_to_anchor=(0.805, 0.515),
+        bbox_to_anchor=(0.825, 0.515),
         ncol=1,
         frameon=False,
         handletextpad=0.40,
