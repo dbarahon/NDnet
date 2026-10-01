@@ -485,6 +485,11 @@ def _attach_sigma_obs(
             pred["sigma_obs"] = obs["sigma_obs"].values
             pred["_obs_row"] = obs["_obs_row"].values
 
+            if "segment_time" in obs.columns:
+                pred["segment_time"] = (
+                    obs["segment_time"].values
+                )
+
             print(
                 f"[MATCH] {campaign}: "
                 f"{len(pred)}/{len(pred)} segments matched "
@@ -567,12 +572,16 @@ def _attach_sigma_obs(
 
         merge_keys = keys + ["_dup"]
 
+        obs_columns = [
+            "_obs_row",
+            "sigma_obs",
+        ]
+
+        if "segment_time" in obs.columns:
+            obs_columns.append("segment_time")
+
         obs_small = obs[
-            merge_keys +
-            [
-                "_obs_row",
-                "sigma_obs",
-            ]
+            merge_keys + obs_columns
         ]
 
         pred = pred.merge(
@@ -707,15 +716,55 @@ def _pressure_range(
 
 def _add_campaign_day_positions(df, width=0.58):
     """
-    Add a compact campaign-day x coordinate for plotting.
+    Add campaign-day coordinates for plotting.
 
-    NDnet_campaign_test.nc stores campaign time at day resolution. Multiple
-    segments from the same day therefore have identical timestamps. Small
-    within-day offsets are used only to keep those segment points visible;
-    they do not imply sub-daily timing.
+    When available, segment_time from the original campaign training file
+    provides the true within-day aircraft timing. Calendar gaps are compressed:
+    the first sampled campaign day is day 1, the next sampled day is day 2,
+    etc., while the fractional part retains the original within-day time.
+
+    Older diagnostic files may only carry day-resolution time. In that
+    fallback case, small within-day offsets keep simultaneous segment points
+    visible; those offsets are visual only.
     """
     out = df.copy()
 
+    # Preferred path: preserve the original segment timestamp recovered from
+    # the campaign training file by _attach_sigma_obs().
+    if "segment_time" in out.columns:
+        segment_time = pd.to_datetime(
+            out["segment_time"],
+            errors="coerce",
+        )
+
+        if segment_time.notna().any():
+            day = segment_time.dt.normalize()
+
+            valid_days = np.sort(
+                day.loc[day.notna()].unique()
+            )
+
+            day_map = {
+                d: i + 1
+                for i, d in enumerate(valid_days)
+            }
+
+            campaign_day = day.map(
+                day_map
+            ).to_numpy(dtype=float)
+
+            fraction = (
+                (segment_time - day)
+                .dt.total_seconds()
+                .to_numpy(dtype=float)
+                / 86400.0
+            )
+
+            out["_campaign_day"] = campaign_day
+            out["_xplot"] = campaign_day + fraction
+            return out
+
+    # Fallback for older files: only the normalized day is available.
     if "time" in out.columns:
         day = pd.to_datetime(
             out["time"],
@@ -737,7 +786,9 @@ def _add_campaign_day_positions(df, width=0.58):
 
     elif "time_idx" in out.columns:
         t = out["time_idx"].to_numpy(dtype=float)
-        valid_t = np.sort(np.unique(t[np.isfinite(t)]))
+        valid_t = np.sort(
+            np.unique(t[np.isfinite(t)])
+        )
         day_map = {
             d: i + 1
             for i, d in enumerate(valid_t)
@@ -766,7 +817,6 @@ def _add_campaign_day_positions(df, width=0.58):
     if np.any(finite_day):
         tmp = out.loc[finite_day].copy()
 
-        # Preserve the prediction-file segment ordering within each day.
         sort_col = (
             "_pred_row"
             if "_pred_row" in tmp.columns
@@ -811,7 +861,6 @@ def _add_campaign_day_positions(df, width=0.58):
 
     return out
 
-
 def plot_campaign_nd_timeseries(
     df,
     out_png,
@@ -831,9 +880,10 @@ def plot_campaign_nd_timeseries(
     campaign Nd scatter: finite pairs, optional positivity for log plotting,
     the observed-Nd threshold, and the optional MODIS mask.
 
-    Because the campaign diagnostic file carries day-resolution time, multiple
-    accepted segments on one day are spread slightly around the integer
-    campaign day for visibility only.
+    Original segment timestamps are recovered from the campaign training
+    files whenever available. Calendar gaps are compressed into campaign-day
+    coordinates while true within-day timing is retained. Older day-resolution
+    diagnostic files fall back to small visual offsets for same-day segments.
     """
     dfs = _campaign_dataframe_list(df)
     n = len(dfs)
