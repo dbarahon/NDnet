@@ -3,11 +3,14 @@
 # Publication-quality campaign diagnostics for NDnet
 #
 # Produces:
-#   1. Observed Nd vs predicted Nd
+#   1. Campaign-wise Nd time series
+#      - observed, NN, and base Nd by campaign day
+#
+#   2. Observed Nd vs predicted Nd
 #      - NN prediction colored by pressure
 #      - Base prediction as open gray circles
 #
-#   2. Observed sigma_Nd vs predicted sigma_Nd
+#   3. Observed sigma_Nd vs predicted sigma_Nd
 #      - sigma_obs = Nd_std from campaign training files
 #      - sigma_nn  = predicted NN sigma from campaign test file
 #      - colored by pressure
@@ -696,6 +699,471 @@ def _pressure_range(
     p = np.concatenate(p)
 
     return float(np.nanmin(p)), float(np.nanmax(p))
+
+
+# ============================================================
+# Nd time-series figure
+# ============================================================
+
+def _add_campaign_day_positions(df, width=0.58):
+    """
+    Add a compact campaign-day x coordinate for plotting.
+
+    NDnet_campaign_test.nc stores campaign time at day resolution. Multiple
+    segments from the same day therefore have identical timestamps. Small
+    within-day offsets are used only to keep those segment points visible;
+    they do not imply sub-daily timing.
+    """
+    out = df.copy()
+
+    if "time" in out.columns:
+        day = pd.to_datetime(
+            out["time"],
+            errors="coerce",
+        ).dt.normalize()
+
+        valid_days = np.sort(
+            day.loc[day.notna()].unique()
+        )
+
+        day_map = {
+            d: i + 1
+            for i, d in enumerate(valid_days)
+        }
+
+        campaign_day = day.map(day_map).to_numpy(
+            dtype=float
+        )
+
+    elif "time_idx" in out.columns:
+        t = out["time_idx"].to_numpy(dtype=float)
+        valid_t = np.sort(np.unique(t[np.isfinite(t)]))
+        day_map = {
+            d: i + 1
+            for i, d in enumerate(valid_t)
+        }
+        campaign_day = np.asarray(
+            [
+                day_map.get(v, np.nan)
+                if np.isfinite(v) else np.nan
+                for v in t
+            ],
+            dtype=float,
+        )
+
+    else:
+        campaign_day = np.arange(
+            1,
+            len(out) + 1,
+            dtype=float,
+        )
+
+    out["_campaign_day"] = campaign_day
+    out["_xplot"] = campaign_day.copy()
+
+    finite_day = np.isfinite(campaign_day)
+
+    if np.any(finite_day):
+        tmp = out.loc[finite_day].copy()
+
+        # Preserve the prediction-file segment ordering within each day.
+        sort_col = (
+            "_pred_row"
+            if "_pred_row" in tmp.columns
+            else None
+        )
+
+        if sort_col is not None:
+            tmp = tmp.sort_values(
+                ["_campaign_day", sort_col]
+            )
+        else:
+            tmp = tmp.sort_values(
+                "_campaign_day",
+                kind="mergesort",
+            )
+
+        grp = tmp.groupby(
+            "_campaign_day",
+            sort=False,
+        )
+
+        within = grp.cumcount().to_numpy(dtype=float)
+        counts = grp["_campaign_day"].transform(
+            "count"
+        ).to_numpy(dtype=float)
+
+        offsets = np.zeros(len(tmp), dtype=float)
+        multi = counts > 1
+
+        offsets[multi] = (
+            (
+                within[multi]
+                - 0.5 * (counts[multi] - 1.0)
+            )
+            / counts[multi]
+        ) * float(width)
+
+        out.loc[tmp.index, "_xplot"] = (
+            tmp["_campaign_day"].to_numpy(dtype=float)
+            + offsets
+        )
+
+    return out
+
+
+def plot_campaign_nd_timeseries(
+    df,
+    out_png,
+    out_pdf=None,
+    obs_col="Nd_obs",
+    nn_col="Nd_nn",
+    base_col="Nd_base",
+    log_axes=True,
+    min_nd_compare=1.0,
+    use_modis_mask=False,
+    ylim=ND_LIM,
+):
+    """
+    Campaign-wise segment Nd time series.
+
+    The NN/observation points use exactly the same pair screening as the
+    campaign Nd scatter: finite pairs, optional positivity for log plotting,
+    the observed-Nd threshold, and the optional MODIS mask.
+
+    Because the campaign diagnostic file carries day-resolution time, multiple
+    accepted segments on one day are spread slightly around the integer
+    campaign day for visibility only.
+    """
+    dfs = _campaign_dataframe_list(df)
+    n = len(dfs)
+
+    if n == 0:
+        print(
+            "[INFO] No campaigns found; "
+            "skipping Nd time series."
+        )
+        return
+
+    values = []
+
+    for dfi in dfs:
+        dfi = _add_campaign_day_positions(dfi)
+
+        sub = _campaign_subset(
+            dfi,
+            obs_col,
+            nn_col,
+            min_compare=min_nd_compare,
+            require_positive=log_axes,
+            use_modis_mask=use_modis_mask,
+        )
+
+        if sub.empty:
+            continue
+
+        values.append(
+            sub[obs_col].to_numpy(dtype=float)
+        )
+        values.append(
+            sub[nn_col].to_numpy(dtype=float)
+        )
+
+        if base_col in sub.columns:
+            base = sub[base_col].to_numpy(dtype=float)
+            base = base[np.isfinite(base)]
+            if base.size:
+                values.append(base)
+
+    auto_lo, auto_hi = _clean_limits(
+        values,
+        log_axes=log_axes,
+    )
+
+    if ylim is None:
+        ylo, yhi = auto_lo, auto_hi
+    else:
+        ylo, yhi = ylim
+
+    nrows, ncols = _campaign_layout_for_n(n)
+
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(
+            3.65 * ncols,
+            2.35 * nrows
+        ),
+        sharey=True,
+        constrained_layout=True,
+    )
+
+    axes = np.atleast_1d(axes).ravel()
+
+    for i, (ax, dfi) in enumerate(
+        zip(axes, dfs)
+    ):
+        campaign = str(
+            dfi["campaign"].iloc[0]
+        )
+
+        dfi = _add_campaign_day_positions(dfi)
+
+        sub = _campaign_subset(
+            dfi,
+            obs_col,
+            nn_col,
+            min_compare=min_nd_compare,
+            require_positive=log_axes,
+            use_modis_mask=use_modis_mask,
+        )
+
+        ax.set_title(
+            f"{_panel_label(i)}  {campaign}",
+            loc="left",
+            fontweight="bold",
+            pad=5,
+        )
+
+        ax.grid(
+            True,
+            which="major",
+            linewidth=0.45,
+            alpha=0.22,
+        )
+
+        if sub.empty:
+            ax.text(
+                0.5,
+                0.5,
+                "No valid points",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                fontsize=8,
+            )
+            continue
+
+        sub = sub.sort_values(
+            ["_campaign_day", "_xplot"],
+            kind="mergesort",
+        )
+
+        x = sub["_xplot"].to_numpy(dtype=float)
+
+        r_n, bias_n, rmse_n, n_n = (
+            _campaign_compute_stats(
+                sub[obs_col].values,
+                sub[nn_col].values,
+            )
+        )
+
+        ax.plot(
+            x,
+            sub[obs_col].values,
+            color="0.15",
+            linewidth=0.75,
+            alpha=0.55,
+            zorder=2,
+        )
+
+        ax.scatter(
+            x,
+            sub[obs_col].values,
+            s=18,
+            marker="o",
+            facecolors="white",
+            edgecolors="0.10",
+            linewidths=0.7,
+            label="Observed",
+            zorder=4,
+        )
+
+        ax.plot(
+            x,
+            sub[nn_col].values,
+            color="#D55E00",
+            linewidth=0.85,
+            alpha=0.72,
+            zorder=2,
+        )
+
+        ax.scatter(
+            x,
+            sub[nn_col].values,
+            s=18,
+            marker="o",
+            color="#D55E00",
+            linewidths=0,
+            label="NDnet",
+            zorder=5,
+        )
+
+        if base_col in sub.columns:
+            b = sub[
+                ["_xplot", base_col]
+            ].copy()
+
+            good_b = np.isfinite(
+                b[base_col].to_numpy(dtype=float)
+            )
+            b = b.loc[good_b]
+
+            if not b.empty:
+                ax.plot(
+                    b["_xplot"].values,
+                    b[base_col].values,
+                    color="0.55",
+                    linestyle="--",
+                    linewidth=0.75,
+                    alpha=0.65,
+                    zorder=1,
+                )
+
+                ax.scatter(
+                    b["_xplot"].values,
+                    b[base_col].values,
+                    s=17,
+                    marker="o",
+                    facecolors="none",
+                    edgecolors="0.50",
+                    linewidths=0.7,
+                    label="Base",
+                    zorder=3,
+                )
+
+        rtxt = (
+            "--"
+            if not np.isfinite(r_n)
+            else f"{r_n:.2f}"
+        )
+
+        ax.set_title(
+            rf"$r$={rtxt}  $n$={n_n}",
+            loc="right",
+            fontsize=8.0,
+            pad=5,
+        )
+
+        if log_axes:
+            ax.set_yscale("log")
+            ax.yaxis.set_major_locator(
+                LogLocator(base=10.0)
+            )
+            ax.yaxis.set_minor_locator(
+                LogLocator(
+                    base=10.0,
+                    subs=np.arange(2, 10) * 0.1,
+                )
+            )
+            ax.yaxis.set_minor_formatter(
+                NullFormatter()
+            )
+
+        ax.set_ylim(ylo, yhi)
+
+        max_day = int(
+            np.nanmax(
+                sub["_campaign_day"].to_numpy(
+                    dtype=float
+                )
+            )
+        )
+
+        ax.set_xlim(0.5, max_day + 0.5)
+
+        if max_day <= 12:
+            ax.set_xticks(
+                np.arange(1, max_day + 1)
+            )
+
+    for ax in axes[n:]:
+        ax.remove()
+
+    for i, ax in enumerate(axes[:n]):
+        row = i // ncols
+        col = i % ncols
+
+        if row == nrows - 1 or i + ncols >= n:
+            ax.set_xlabel("Campaign day")
+        else:
+            ax.set_xlabel("")
+
+        if col == 0:
+            ax.set_ylabel(
+                r"$N_d$ (cm$^{-3}$)"
+            )
+        else:
+            ax.set_ylabel("")
+
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="-",
+            linewidth=0.8,
+            markersize=4.5,
+            color="0.15",
+            markerfacecolor="white",
+            markeredgecolor="0.10",
+            label="Observed",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="-",
+            linewidth=0.8,
+            markersize=4.5,
+            color="#D55E00",
+            markerfacecolor="#D55E00",
+            markeredgecolor="none",
+            label="NDnet",
+        ),
+    ]
+
+    if base_col in df.columns:
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="--",
+                linewidth=0.8,
+                markersize=4.5,
+                color="0.50",
+                markerfacecolor="none",
+                markeredgecolor="0.50",
+                label="Base",
+            )
+        )
+
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        ncol=len(handles),
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.015),
+        handletextpad=0.5,
+        columnspacing=1.3,
+    )
+
+    fig.savefig(
+        out_png,
+        dpi=300,
+        bbox_inches="tight",
+    )
+    print(f"[WROTE] {out_png}")
+
+    if out_pdf is not None:
+        fig.savefig(
+            out_pdf,
+            bbox_inches="tight",
+        )
+        print(f"[WROTE] {out_pdf}")
+
+    plt.close(fig)
 
 
 # ============================================================
@@ -1547,7 +2015,28 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Nd figure
+    # Nd time-series figure
+    # --------------------------------------------------------
+
+    nd_ts_png = (
+        "NDnet_campaign_Nd_timeseries.png"
+    )
+
+    nd_ts_pdf = (
+        "NDnet_campaign_Nd_timeseries.pdf"
+    )
+
+    plot_campaign_nd_timeseries(
+        df,
+        out_png=nd_ts_png,
+        out_pdf=nd_ts_pdf,
+        log_axes=not args.linear_nd,
+        min_nd_compare=args.min_nd,
+        use_modis_mask=args.modis_mask,
+    )
+
+    # --------------------------------------------------------
+    # Nd scatter figure
     # --------------------------------------------------------
 
     nd_png = (
