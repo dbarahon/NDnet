@@ -871,14 +871,21 @@ def plot_campaign_nd_timeseries(
     log_axes=True,
     min_nd_compare=1.0,
     use_modis_mask=False,
+    daily_mean=False,
     ylim=ND_LIM,
 ):
     """
-    Campaign-wise segment Nd time series.
+    Campaign-wise Nd time series.
 
-    The NN/observation points use exactly the same pair screening as the
-    campaign Nd scatter: finite pairs, optional positivity for log plotting,
-    the observed-Nd threshold, and the optional MODIS mask.
+    Correlations are always computed from the individual accepted segments.
+    daily_mean=True changes only the displayed time series: accepted segments
+    are averaged within each campaign day for visual clarity.
+
+    The NN/observation points use the same pair screening as the campaign Nd
+    scatter: finite pairs, optional positivity for log plotting, the observed
+    Nd threshold, and the optional MODIS mask. Base correlation is computed
+    independently with the same screening rules applied to observation/base
+    pairs.
 
     Original segment timestamps are recovered from the campaign training
     files whenever available. Calendar gaps are compressed into campaign-day
@@ -900,7 +907,7 @@ def plot_campaign_nd_timeseries(
     for dfi in dfs:
         dfi = _add_campaign_day_positions(dfi)
 
-        sub = _campaign_subset(
+        sub_nn = _campaign_subset(
             dfi,
             obs_col,
             nn_col,
@@ -909,18 +916,18 @@ def plot_campaign_nd_timeseries(
             use_modis_mask=use_modis_mask,
         )
 
-        if sub.empty:
+        if sub_nn.empty:
             continue
 
         values.append(
-            sub[obs_col].to_numpy(dtype=float)
+            sub_nn[obs_col].to_numpy(dtype=float)
         )
         values.append(
-            sub[nn_col].to_numpy(dtype=float)
+            sub_nn[nn_col].to_numpy(dtype=float)
         )
 
-        if base_col in sub.columns:
-            base = sub[base_col].to_numpy(dtype=float)
+        if base_col in sub_nn.columns:
+            base = sub_nn[base_col].to_numpy(dtype=float)
             base = base[np.isfinite(base)]
             if base.size:
                 values.append(base)
@@ -937,15 +944,17 @@ def plot_campaign_nd_timeseries(
 
     nrows, ncols = _campaign_layout_for_n(n)
 
+    # Slightly taller panels than the scatter figure. Use manual spacing so a
+    # dedicated top margin can be reserved for the shared legend.
     fig, axes = plt.subplots(
         nrows,
         ncols,
         figsize=(
             3.65 * ncols,
-            2.35 * nrows
+            2.75 * nrows + 0.35
         ),
         sharey=True,
-        constrained_layout=True,
+        constrained_layout=False,
     )
 
     axes = np.atleast_1d(axes).ravel()
@@ -959,7 +968,11 @@ def plot_campaign_nd_timeseries(
 
         dfi = _add_campaign_day_positions(dfi)
 
-        sub = _campaign_subset(
+        # ----------------------------------------------------
+        # Segment-level samples used for statistics
+        # ----------------------------------------------------
+
+        sub_nn = _campaign_subset(
             dfi,
             obs_col,
             nn_col,
@@ -967,6 +980,18 @@ def plot_campaign_nd_timeseries(
             require_positive=log_axes,
             use_modis_mask=use_modis_mask,
         )
+
+        sub_base = None
+
+        if base_col in dfi.columns:
+            sub_base = _campaign_subset(
+                dfi,
+                obs_col,
+                base_col,
+                min_compare=min_nd_compare,
+                require_positive=log_axes,
+                use_modis_mask=use_modis_mask,
+            )
 
         ax.set_title(
             f"{_panel_label(i)}  {campaign}",
@@ -982,7 +1007,7 @@ def plot_campaign_nd_timeseries(
             alpha=0.22,
         )
 
-        if sub.empty:
+        if sub_nn.empty:
             ax.text(
                 0.5,
                 0.5,
@@ -994,23 +1019,97 @@ def plot_campaign_nd_timeseries(
             )
             continue
 
-        sub = sub.sort_values(
-            ["_campaign_day", "_xplot"],
-            kind="mergesort",
-        )
-
-        x = sub["_xplot"].to_numpy(dtype=float)
-
         r_n, bias_n, rmse_n, n_n = (
             _campaign_compute_stats(
-                sub[obs_col].values,
-                sub[nn_col].values,
+                sub_nn[obs_col].values,
+                sub_nn[nn_col].values,
             )
         )
 
+        if sub_base is not None and not sub_base.empty:
+            r_b, bias_b, rmse_b, n_b = (
+                _campaign_compute_stats(
+                    sub_base[obs_col].values,
+                    sub_base[base_col].values,
+                )
+            )
+        else:
+            r_b = np.nan
+            n_b = 0
+
+        rtxt_n = (
+            "--"
+            if not np.isfinite(r_n)
+            else f"{r_n:.2f}"
+        )
+        rtxt_b = (
+            "--"
+            if not np.isfinite(r_b)
+            else f"{r_b:.2f}"
+        )
+
+        ax.set_title(
+            rf"NN $r$={rtxt_n}  Base $r$={rtxt_b}",
+            loc="right",
+            fontsize=7.7,
+            pad=5,
+        )
+
+        # ----------------------------------------------------
+        # Display sample
+        # ----------------------------------------------------
+
+        plot_df = sub_nn.copy()
+
+        # Base is displayed on the same screened observation/NN segment set
+        # for direct visual comparison. Its correlation above remains based
+        # on its own valid observation/base pairs.
+        keep_cols = [
+            "_campaign_day",
+            "_xplot",
+            obs_col,
+            nn_col,
+        ]
+
+        if base_col in plot_df.columns:
+            keep_cols.append(base_col)
+
+        plot_df = plot_df[keep_cols].copy()
+
+        if daily_mean:
+            value_cols = [
+                obs_col,
+                nn_col,
+            ]
+
+            if base_col in plot_df.columns:
+                value_cols.append(base_col)
+
+            plot_df = (
+                plot_df.groupby(
+                    "_campaign_day",
+                    as_index=False,
+                    sort=True,
+                )[value_cols]
+                .mean()
+            )
+
+            # One point per campaign day; retain the compressed day index.
+            plot_df["_xplot"] = (
+                plot_df["_campaign_day"].to_numpy(dtype=float)
+            )
+
+        else:
+            plot_df = plot_df.sort_values(
+                ["_campaign_day", "_xplot"],
+                kind="mergesort",
+            )
+
+        x = plot_df["_xplot"].to_numpy(dtype=float)
+
         ax.plot(
             x,
-            sub[obs_col].values,
+            plot_df[obs_col].values,
             color="0.15",
             linewidth=0.75,
             alpha=0.55,
@@ -1019,8 +1118,8 @@ def plot_campaign_nd_timeseries(
 
         ax.scatter(
             x,
-            sub[obs_col].values,
-            s=18,
+            plot_df[obs_col].values,
+            s=20 if daily_mean else 18,
             marker="o",
             facecolors="white",
             edgecolors="0.10",
@@ -1031,17 +1130,17 @@ def plot_campaign_nd_timeseries(
 
         ax.plot(
             x,
-            sub[nn_col].values,
+            plot_df[nn_col].values,
             color="#D55E00",
-            linewidth=0.85,
-            alpha=0.72,
+            linewidth=0.9 if daily_mean else 0.85,
+            alpha=0.75,
             zorder=2,
         )
 
         ax.scatter(
             x,
-            sub[nn_col].values,
-            s=18,
+            plot_df[nn_col].values,
+            s=20 if daily_mean else 18,
             marker="o",
             color="#D55E00",
             linewidths=0,
@@ -1049,31 +1148,32 @@ def plot_campaign_nd_timeseries(
             zorder=5,
         )
 
-        if base_col in sub.columns:
-            b = sub[
-                ["_xplot", base_col]
-            ].copy()
-
+        if base_col in plot_df.columns:
             good_b = np.isfinite(
-                b[base_col].to_numpy(dtype=float)
+                plot_df[base_col].to_numpy(dtype=float)
             )
-            b = b.loc[good_b]
 
-            if not b.empty:
+            if np.any(good_b):
+                xb = x[good_b]
+                yb = plot_df.loc[
+                    good_b,
+                    base_col,
+                ].to_numpy(dtype=float)
+
                 ax.plot(
-                    b["_xplot"].values,
-                    b[base_col].values,
+                    xb,
+                    yb,
                     color="0.55",
                     linestyle="--",
-                    linewidth=0.75,
+                    linewidth=0.8,
                     alpha=0.65,
                     zorder=1,
                 )
 
                 ax.scatter(
-                    b["_xplot"].values,
-                    b[base_col].values,
-                    s=17,
+                    xb,
+                    yb,
+                    s=19 if daily_mean else 17,
                     marker="o",
                     facecolors="none",
                     edgecolors="0.50",
@@ -1081,19 +1181,6 @@ def plot_campaign_nd_timeseries(
                     label="Base",
                     zorder=3,
                 )
-
-        rtxt = (
-            "--"
-            if not np.isfinite(r_n)
-            else f"{r_n:.2f}"
-        )
-
-        ax.set_title(
-            rf"$r$={rtxt}  $n$={n_n}",
-            loc="right",
-            fontsize=8.0,
-            pad=5,
-        )
 
         if log_axes:
             ax.set_yscale("log")
@@ -1114,7 +1201,7 @@ def plot_campaign_nd_timeseries(
 
         max_day = int(
             np.nanmax(
-                sub["_campaign_day"].to_numpy(
+                sub_nn["_campaign_day"].to_numpy(
                     dtype=float
                 )
             )
@@ -1194,9 +1281,20 @@ def plot_campaign_nd_timeseries(
         loc="upper center",
         ncol=len(handles),
         frameon=False,
-        bbox_to_anchor=(0.5, 1.015),
+        bbox_to_anchor=(0.5, 0.992),
         handletextpad=0.5,
         columnspacing=1.3,
+    )
+
+    # Reserve explicit space above the top row for the legend and use more
+    # vertical separation between campaign rows.
+    fig.subplots_adjust(
+        left=0.075,
+        right=0.985,
+        bottom=0.075,
+        top=0.91,
+        wspace=0.20,
+        hspace=0.34,
     )
 
     fig.savefig(
@@ -2018,6 +2116,15 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--daily-mean-nd-timeseries",
+        action="store_true",
+        help=(
+            "Plot one mean Nd value per campaign day in the Nd time-series "
+            "figure. Correlations remain segment-level."
+        ),
+    )
+
     args = parser.parse_args()
 
     exp_dir = args.experiment_dir.expanduser().resolve()
@@ -2083,6 +2190,7 @@ def main():
         log_axes=not args.linear_nd,
         min_nd_compare=args.min_nd,
         use_modis_mask=args.modis_mask,
+        daily_mean=args.daily_mean_nd_timeseries,
     )
 
     # --------------------------------------------------------
