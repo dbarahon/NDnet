@@ -133,6 +133,29 @@ def _pressure_ticks(lev: np.ndarray) -> np.ndarray:
     return standard[(standard >= lo) & (standard <= hi)]
 
 
+def _parse_positive_ticks(spec: str | None) -> tuple[float, ...] | None:
+    """Parse comma-separated positive magnitudes used for symmetric impact ticks."""
+    if spec is None:
+        return None
+
+    vals = []
+    for item in str(spec).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        value = float(item)
+        if not np.isfinite(value) or value <= 0:
+            raise argparse.ArgumentTypeError(
+                "--impact-ticks must contain finite positive values, e.g. 1,2,5,10,20"
+            )
+        vals.append(value)
+
+    if not vals:
+        raise argparse.ArgumentTypeError("--impact-ticks cannot be empty")
+
+    return tuple(sorted(set(vals)))
+
+
 def plot_ablation_fields(
     zonal_ablation: np.ndarray,
     lat: np.ndarray,
@@ -198,8 +221,16 @@ def plot_ablation_impact(
     out_png: Path,
     *,
     impact_vmax: float | None = None,
+    impact_scale: str = "linear",
+    impact_linthresh: float = 1.0,
+    impact_ticks: tuple[float, ...] | None = None,
 ):
-    """Plot zonal (ablated - full) Nd for each removed refinement mode."""
+    """Plot zonal (ablated - full) Nd for each removed refinement mode.
+
+    With impact_scale="symlog", weak impacts near zero are expanded while the
+    diverging normalization remains symmetric. impact_ticks contains positive
+    magnitudes and is mirrored automatically about zero.
+    """
     vals = np.asarray(impact, dtype=float)
     finite_abs = np.abs(vals[np.isfinite(vals)])
     if impact_vmax is None:
@@ -211,7 +242,19 @@ def plot_ablation_impact(
         impact_vmax = 1.0
 
     fig, axes = _panel_axes()
-    norm = mcolors.TwoSlopeNorm(vmin=-impact_vmax, vcenter=0.0, vmax=impact_vmax)
+    if impact_scale == "linear":
+        norm = mcolors.TwoSlopeNorm(vmin=-impact_vmax, vcenter=0.0, vmax=impact_vmax)
+    elif impact_scale == "symlog":
+        norm = mcolors.SymLogNorm(
+            linthresh=float(impact_linthresh),
+            linscale=1.0,
+            vmin=-impact_vmax,
+            vmax=impact_vmax,
+            base=10,
+        )
+    else:
+        raise ValueError(f"Unknown impact scale: {impact_scale!r}")
+
     p_ticks = _pressure_ticks(lev)
     mappable = None
 
@@ -249,6 +292,12 @@ def plot_ablation_impact(
         aspect=45,
     )
     cb.set_label(r"Ablated $-$ full $N_d$ (cm$^{-3}$)", fontsize=10)
+    if impact_ticks is not None:
+        positive = np.asarray(impact_ticks, dtype=float)
+        positive = positive[positive <= impact_vmax * (1.0 + 1e-12)]
+        ticks = np.concatenate((-positive[::-1], [0.0], positive))
+        cb.set_ticks(ticks)
+        cb.set_ticklabels([f"{x:g}" for x in ticks])
     cb.ax.tick_params(labelsize=8)
 
     fig.savefig(out_png, dpi=180, bbox_inches="tight")
@@ -433,10 +482,45 @@ def main():
         default=None,
         help="Symmetric impact color limit; default is pooled 99th percentile |impact|.",
     )
+    p.add_argument(
+        "--impact-scale",
+        choices=("linear", "symlog"),
+        default="linear",
+        help=(
+            "Impact color normalization. 'symlog' expands weak higher-mode impacts "
+            "near zero while remaining symmetric (default: linear)."
+        ),
+    )
+    p.add_argument(
+        "--impact-linthresh",
+        type=float,
+        default=1.0,
+        help=(
+            "Half-width of the linear region around zero for --impact-scale symlog "
+            "(cm-3; default: 1)."
+        ),
+    )
+    p.add_argument(
+        "--impact-ticks",
+        type=_parse_positive_ticks,
+        default=None,
+        metavar="LIST",
+        help=(
+            "Comma-separated positive impact tick magnitudes. They are mirrored "
+            "about zero automatically; for example 1,2,5,10,20 gives "
+            "-20,-10,-5,-2,-1,0,1,2,5,10,20."
+        ),
+    )
     args = p.parse_args()
 
     if args.vmin <= 0 or args.vmax <= args.vmin:
         raise ValueError("Require 0 < --vmin < --vmax for logarithmic Nd plotting")
+    if args.impact_vmax is not None and (
+        not np.isfinite(args.impact_vmax) or args.impact_vmax <= 0
+    ):
+        raise ValueError("--impact-vmax must be finite and > 0")
+    if not np.isfinite(args.impact_linthresh) or args.impact_linthresh <= 0:
+        raise ValueError("--impact-linthresh must be finite and > 0")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weights = _resolve_weights(args.weights)
@@ -507,6 +591,9 @@ def main():
         lev,
         impact_png,
         impact_vmax=args.impact_vmax,
+        impact_scale=args.impact_scale,
+        impact_linthresh=args.impact_linthresh,
+        impact_ticks=args.impact_ticks,
     )
 
     summary = build_summary(impact, lev, lat)
