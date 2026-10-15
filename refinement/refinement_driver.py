@@ -11,6 +11,7 @@ from profile_taper import (
     apply_sigma_pressure_taper,
     normalize_taper_mode,
 )
+from holdout import site_holdout_mask, campaign_holdout_mask, save_manifest
 from diagnostic_cache import (
     diagnostic_cache_valid,
     diagnostic_time_indices,
@@ -301,6 +302,17 @@ def load_site_campaign_state(
             verbose=True,
         )
 
+    site_test_mask = site_holdout_mask(Nd_sites, cfg.HOLDOUT_FRACTION, cfg.HOLDOUT_SEED)
+    campaign_test_mask = (
+        campaign_holdout_mask(campaign_ds, cfg.HOLDOUT_FRACTION, cfg.HOLDOUT_SEED)
+        if campaign_ds is not None else None
+    )
+    if not evaluation_only:
+        save_manifest(Nd_sites, site_test_mask, campaign_ds, campaign_test_mask,
+                      cfg.HOLDOUT_MANIFEST, cfg.HOLDOUT_SEED, cfg.HOLDOUT_FRACTION)
+    print(f"[HOLDOUT] site profiles: {site_test_mask.sum()}")
+    if campaign_test_mask is not None:
+        print(f"[HOLDOUT] campaign segments: {campaign_test_mask.sum()}")
     tensor_time_idx = all_idx
     tensors_sparse = False
 
@@ -370,6 +382,8 @@ def load_site_campaign_state(
         "tensors_sparse": bool(tensors_sparse),
         "campaign_ds": campaign_ds,
         "camp_bundle": camp_bundle,
+        "site_test_mask": site_test_mask,
+        "campaign_test_mask": campaign_test_mask,
     }
 
 
@@ -427,7 +441,26 @@ def make_training_loaders(state, numwork):
     train_idx = all_idx[:split]
     val_idx = all_idx[split:]
 
+    hold = state["site_test_mask"]
+    nd_train = state["Nds"].clone()
+    ed_train = state["Eds"].clone()
+    ys_train = state["YS_t"].clone()
+    vs_train = state["VS_t"].clone()
+    hold_t = torch.as_tensor(hold, dtype=torch.bool, device=vs_train.device)
+    nd_train = nd_train.masked_fill(hold_t[:, None, :], float("nan"))
+    ed_train = ed_train.masked_fill(hold_t[:, None, :], float("nan"))
+    ys_train = ys_train.masked_fill(hold_t[:, None, :], float("nan"))
+    vs_train = vs_train.masked_fill(hold_t, False)
     camp_bundle = state["camp_bundle"]
+    if camp_bundle is not None and state["campaign_test_mask"] is not None:
+        from dataclasses import replace
+        keep = torch.as_tensor(~state["campaign_test_mask"], dtype=torch.bool,
+                               device=camp_bundle.valid_obs.device)
+        camp_bundle = replace(
+            camp_bundle,
+            valid_obs=camp_bundle.valid_obs & keep,
+            aug_valid=camp_bundle.aug_valid & keep.unsqueeze(0),
+        )
     use_campaigns = camp_bundle is not None
 
     if use_campaigns:
@@ -469,20 +502,20 @@ def make_training_loaders(state, numwork):
     ds_train = EOFNdMultiObsDatasetTorch(
         X2d_t=state["X2d_t"],
         MU0_t=state["MU0_t"],
-        YS_t=state["YS_t"],
-        VS_t=state["VS_t"],
-        Nds_t=state["Nds"],
-        Eds_t=state["Eds"],
+        YS_t=ys_train,
+        VS_t=vs_train,
+        Nds_t=nd_train,
+        Eds_t=ed_train,
         campaign_bundle=camp_bundle,
         time_idx=train_idx_final,
     )
     ds_val = EOFNdMultiObsDatasetTorch(
         X2d_t=state["X2d_t"],
         MU0_t=state["MU0_t"],
-        YS_t=state["YS_t"],
-        VS_t=state["VS_t"],
-        Nds_t=state["Nds"],
-        Eds_t=state["Eds"],
+        YS_t=ys_train,
+        VS_t=vs_train,
+        Nds_t=nd_train,
+        Eds_t=ed_train,
         campaign_bundle=camp_bundle,
         time_idx=val_idx_use,
     )
@@ -666,7 +699,9 @@ def run_site_diagnostics(
     Ares_base = state["Ares_base"]
     site_meta = state["site_meta"]
 
-    Nd_true = Nd_sites.rename("Nd_true")
+    hold_da = xr.DataArray(state["site_test_mask"], dims=("time", "site"),
+                           coords={"time": Nd_sites.time, "site": Nd_sites.site})
+    Nd_true = Nd_sites.where(hold_da).rename("Nd_true")
     site_mask = np.isfinite(Nd_true).any("lev").astype("uint8").rename("site_mask")
 
     for c in ["site", "ilat", "ilon", "site_lat", "site_lon"]:
@@ -780,6 +815,7 @@ def run_site_diagnostics(
         if c in site_meta:
             dsS_raw = dsS_raw.assign_coords({c: ("site", site_meta[c].values)})
 
+    dsS_raw.attrs["observation_partition"] = "independent_holdout20"
     dsS_raw.attrs["diagnostic_inference_days"] = int(len(infer_idx))
     dsS_raw.attrs["diagnostic_total_days"] = int(len(state["all_idx"]))
     write_diagnostic_cache(dsS_raw, "site", model_name)
@@ -887,6 +923,9 @@ def run_campaign_diagnostics(
             dims=("segment",),
         )
 
+    if state["campaign_test_mask"] is not None:
+        dsC_raw = dsC_raw.isel(segment=np.flatnonzero(state["campaign_test_mask"]))
+    dsC_raw.attrs["observation_partition"] = "independent_holdout20"
     dsC_raw.attrs["diagnostic_inference_days"] = int(len(infer_idx))
     dsC_raw.attrs["diagnostic_total_days"] = int(len(state["all_idx"]))
     write_diagnostic_cache(dsC_raw, "campaign", model_name)
