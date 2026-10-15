@@ -6,7 +6,7 @@ import xarray as xr
 # ============================================================
 
 MODEL_BASE = "NDnet_EOFcoeff"
-MODEL_NAME = "NDnet_EOFcoeff_dimless"
+MODEL_NAME = "NDnet_EOFcoeff_dimless_holdout20"
 BASEROOT = "/panfs/ccds02/nobackup/people/dbarahon/NDnet/EOF/in_cloudM2/best/"
 
 # Independent actions.
@@ -19,6 +19,10 @@ do_test = True
 # TRAIN_WITH_CAMPAIGNS=False trains on fixed sites only, while
 # do_campaigns=True can still evaluate the resulting model on campaigns.
 TRAIN_WITH_CAMPAIGNS = True
+
+HOLDOUT_FRACTION = 0.20
+HOLDOUT_SEED = 2026
+HOLDOUT_MANIFEST = "NDnet_heldout_observations.json"
 
 # Training initialization:
 #   "weights" -> start epoch 0 from TRAIN_INIT_WEIGHTS
