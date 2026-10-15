@@ -728,7 +728,7 @@ def run_site_diagnostics(
         EOF=EOF,
         Nd_mean=Nd_mean,
         A_mean=A_mean,
-        valid_ref=Nd_sites,
+        valid_ref=Nd_true,
         mask_mode=sitemaskmode,
     )
     Nd_rec_tls = Nd_rec_lts.rename("Nd_rec").transpose("time", "lev", "site")
@@ -743,7 +743,7 @@ def run_site_diagnostics(
         EOF=EOF,
         Nd_mean=Nd_mean,
         A_mean=A_mean,
-        valid_ref=Nd_sites,
+        valid_ref=Nd_true,
         mask_mode=sitemaskmode,
     )
     Nd_base_tls = Nd_base_lts.transpose("time", "lev", "site").rename("Nd_base")
