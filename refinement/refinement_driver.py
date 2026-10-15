@@ -460,6 +460,8 @@ def make_training_loaders(state, numwork):
             camp_bundle,
             valid_obs=camp_bundle.valid_obs & keep,
             aug_valid=camp_bundle.aug_valid & keep.unsqueeze(0),
+            y_mean=camp_bundle.y_mean.masked_fill(~keep, float("nan")),
+            y_aug=camp_bundle.y_aug.masked_fill(~keep.unsqueeze(0), float("nan")),
         )
     use_campaigns = camp_bundle is not None
 
