@@ -61,6 +61,9 @@ def diagnostic_cache_signature(model_name):
         "diagnostic_prefix_dense": str(cfg.prefix_dense),
         "diagnostic_prefix_sites": str(cfg.prefix_sites),
         "diagnostic_site_mask_mode": str(cfg.sitemaskmode),
+        "diagnostic_holdout_fraction": str(getattr(cfg, "HOLDOUT_FRACTION", 0)),
+        "diagnostic_holdout_seed": str(getattr(cfg, "HOLDOUT_SEED", 0)),
+        "diagnostic_observation_partition": "holdout_only",
         "diagnostic_bypass_infer": str(bool(cfg.bypass_infer)),
         "diagnostic_site_json": str(cfg.SITE_JSON),
         "diagnostic_campaign_dir": str(
