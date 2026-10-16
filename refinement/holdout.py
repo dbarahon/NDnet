@@ -42,17 +42,49 @@ def site_holdout_mask(nd_sites, fraction=0.2, seed=2026):
     return mask
 
 
+def _choose_flight_groups(keys, fraction, seed, campaign):
+    """Exact subset-sum optimization of segment count, with seeded tie breaks.
+
+    Each flight/day group is indivisible. Dynamic programming stores one
+    deterministic representative for every achievable number of segments.
+    Both test and training must receive at least one group.
+    """
+    if not 0 <= fraction < 1:
+        raise ValueError("holdout fraction must be in [0,1)")
+    groups = sorted(set(keys))
+    if fraction == 0 or len(groups) < 2:
+        return set()
+    counts = {key: keys.count(key) for key in groups}
+    order = sorted(groups, key=lambda k: (_score("flight", campaign, k, seed=seed), k))
+    # For each achievable count, keep the first subset found in seeded order.
+    attainable = {0: ()}
+    for key in order:
+        n = counts[key]
+        for total, selected in list(attainable.items()):
+            candidate = total + n
+            if candidate not in attainable:
+                attainable[candidate] = selected + (key,)
+    total = len(keys)
+    target = fraction * total
+    eligible = [n for n in attainable if 0 < n < total]
+    if not eligible:
+        return set()
+    # Prefer the larger test set on an exact-distance tie; flight identities
+    # remain seed-dependent when multiple combinations yield the same size.
+    best = min(eligible, key=lambda n: (abs(n - target), -n))
+    return set(attainable[best])
+
+
 def campaign_holdout_mask(ds, fraction=0.2, seed=2026):
-    """Hold out complete campaign flight/day groups; never split flight segments."""
+    """Hold out complete flights, optimizing the fraction of usable segments."""
     camps = np.asarray(ds["campaign"].values).astype(str)
-    days = np.asarray(ds["day"].values).astype("datetime64[ns]").astype(str)
+    days = np.asarray(ds["day"].values).astype("datetime64[D]").astype(str)
     flights = np.asarray(ds["flightID"].values).astype(str) if "flightID" in ds else days
     mask = np.zeros(len(camps), dtype=bool)
     for camp in sorted(set(camps)):
         rows = np.flatnonzero(camps == camp)
-        # Flight ID may repeat across different dates; combine it with day.
         keys = [days[i] + "|" + flights[i] for i in rows]
-        chosen = _select(keys, fraction, seed, "campaign:" + camp)
+        chosen = _choose_flight_groups(keys, fraction, seed, camp)
         mask[rows] = [key in chosen for key in keys]
     return mask
 
@@ -62,11 +94,29 @@ def save_manifest(site_da, site_mask, campaign_ds, campaign_mask, path, seed, fr
     times = np.asarray(site_da.time.values).astype("datetime64[ns]").astype(str)
     sites = [str(x) for x in site_da.site.values]
     t, s = np.where(site_mask)
-    data = dict(schema="NDnet observation holdout v1", seed=int(seed),
+    data = dict(schema="NDnet observation holdout v2", seed=int(seed),
                 fraction=float(fraction), site_profiles=[
                     {"site": sites[j], "day": times[i]} for i, j in zip(t.tolist(), s.tolist())
-                ], campaign_segments=[])
+                ], campaign_segments=[], campaign_summary=[])
     if campaign_ds is not None and campaign_mask is not None:
+        full_camps = np.asarray(campaign_ds["campaign"].values).astype(str)
+        full_days = np.asarray(campaign_ds["day"].values).astype("datetime64[D]").astype(str)
+        full_flights = (np.asarray(campaign_ds["flightID"].values).astype(str)
+                        if "flightID" in campaign_ds else full_days)
+        for camp in sorted(set(full_camps)):
+            rows = np.flatnonzero(full_camps == camp)
+            selected = rows[campaign_mask[rows]]
+            groups = [full_days[i] + "|" + full_flights[i] for i in rows]
+            selected_groups = sorted(set(full_days[i] + "|" + full_flights[i]
+                                         for i in selected))
+            data["campaign_summary"].append(dict(
+                campaign=camp, n_usable_segments=int(len(rows)),
+                n_test_segments=int(len(selected)),
+                target_test_segments=float(fraction * len(rows)),
+                achieved_fraction=float(len(selected) / len(rows)),
+                n_flight_groups=int(len(set(groups))),
+                selected_flight_groups=selected_groups,
+            ))
         ds = campaign_ds.isel(segment=np.flatnonzero(campaign_mask))
         for i in range(ds.sizes["segment"]):
             data["campaign_segments"].append(dict(
