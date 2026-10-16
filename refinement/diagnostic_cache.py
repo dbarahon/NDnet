@@ -23,7 +23,7 @@ import xarray as xr
 import config as cfg
 
 
-CACHE_VERSION = "2"
+CACHE_VERSION = "3"
 _RAW_SITE_MASK_CACHE = {}
 
 
