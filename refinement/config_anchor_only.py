@@ -1,7 +1,7 @@
 # EXPERIMENT: anchor-only pretraining, no observational targets in loss.
 # To run: copy this file to refinement/config.py after backing up the original.
 # Afterward restore original config.py and initialize from NDnet_anchor_only_weights.pt.
-# Sigma head gets no gradient in this stage; it is NOT calibrated.
+# Sigma head is frozen in this stage; it is NOT calibrated.\n# Use the normal config for subsequent observational refinement.
 import numpy as np
 import xarray as xr
 
@@ -33,6 +33,9 @@ HOLDOUT_MANIFEST = "NDnet_heldout_observations.json"
 #   "scratch" -> random model initialization
 #   "resume"  -> resume MODEL_NAME.ckpt when present; otherwise random init
 TRAIN_INIT_MODE = "scratch"
+SCRATCH_INIT_STRATEGY = "random"
+ANCHOR_ONLY_PRETRAIN = True
+SCRATCH_INITIAL_SIGMA = 1.0
 TRAIN_INIT_WEIGHTS = "./NDnet_EOFcoeff_sigmaFT_weights.pt"
 
 min_valid_lev = 2
