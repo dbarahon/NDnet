@@ -32,6 +32,10 @@ TRAIN_INIT_MODE = "weights"
 TRAIN_INIT_WEIGHTS = "./NDnet_EOFcoeff_sigmaFT_weights.pt"
 # Used only for scratch initialization; in EOF coefficient units.
 SCRATCH_INITIAL_SIGMA = 1.0
+# "zero" = prior-preserving output heads; "random" = standard random initialization.
+SCRATCH_INIT_STRATEGY = "zero"
+# Experimental anchor-only stage: use config_anchor_only.py (all losses disabled except anchor).
+ANCHOR_ONLY_PRETRAIN = False
 
 min_valid_lev = 2
 write_site_debug = False
