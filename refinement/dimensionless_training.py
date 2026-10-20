@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import math
+
+import torch
+import torch.nn as nn
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,6 +33,31 @@ from train_infer import (
 _VALID_INIT_MODES = {"weights", "scratch", "resume"}
 
 
+def initialize_scratch_outputs(model, sigma0=1.0):
+    """Start at the prior mean with spatially uniform positive coefficient sigma.
+
+    Only final output convolutions are changed; earlier layers retain their
+    random initialization and become trainable as the heads learn.
+    """
+    net = model.module if hasattr(model, "module") else model
+    if not hasattr(net, "delta_head") or not hasattr(net, "sigma_head"):
+        raise AttributeError("Scratch initialization expects delta_head and sigma_head")
+    delta_layers = [m for m in net.delta_head.modules() if isinstance(m, nn.Conv2d)]
+    sigma_layers = [m for m in net.sigma_head.modules() if isinstance(m, nn.Conv2d)]
+    if not delta_layers or not sigma_layers:
+        raise RuntimeError("No Conv2d output layer found in one of the heads")
+    sigma_min = float(net.sigma_min)
+    if not math.isfinite(sigma0) or sigma0 <= sigma_min:
+        raise ValueError(f"Initial sigma must exceed sigma_min={sigma_min}; got {sigma0}")
+    rho0 = math.log(math.expm1(sigma0 - sigma_min))
+    with torch.no_grad():
+        nn.init.zeros_(delta_layers[-1].weight)
+        nn.init.zeros_(delta_layers[-1].bias)
+        nn.init.zeros_(sigma_layers[-1].weight)
+        nn.init.constant_(sigma_layers[-1].bias, rho0)
+    print(f"[INIT] scratch prior-preserving: delta=0, initial sigma={sigma0:g}")
+
+
 def initialize_training_model(model, optimizer, *, device, model_name):
     """Apply the configured initialization policy explicitly and return epoch."""
     mode = str(getattr(cfg, "TRAIN_INIT_MODE", "resume")).strip().lower()
@@ -38,7 +67,8 @@ def initialize_training_model(model, optimizer, *, device, model_name):
         )
 
     if mode == "scratch":
-        print("[INIT] mode=scratch: using random model initialization")
+        print("[INIT] mode=scratch: initializing prior-preserving output heads")
+        initialize_scratch_outputs(model, sigma0=float(getattr(cfg, "SCRATCH_INITIAL_SIGMA", 1.0)))
         return 0
 
     if mode == "weights":
