@@ -67,8 +67,16 @@ def initialize_training_model(model, optimizer, *, device, model_name):
         )
 
     if mode == "scratch":
-        print("[INIT] mode=scratch: initializing prior-preserving output heads")
-        initialize_scratch_outputs(model, sigma0=float(getattr(cfg, "SCRATCH_INITIAL_SIGMA", 1.0)))
+        strategy = str(getattr(cfg, "SCRATCH_INIT_STRATEGY", "zero")).lower()
+        if strategy == "zero":
+            print("[INIT] mode=scratch strategy=zero: prior-preserving output heads")
+            initialize_scratch_outputs(
+                model, sigma0=float(getattr(cfg, "SCRATCH_INITIAL_SIGMA", 1.0))
+            )
+        elif strategy == "random":
+            print("[INIT] mode=scratch strategy=random: unmodified random weights")
+        else:
+            raise ValueError(f"Unknown SCRATCH_INIT_STRATEGY={strategy!r}")
         return 0
 
     if mode == "weights":
@@ -166,6 +174,27 @@ def _write_loss_scale_metadata(model_name, coeff_scales, n_training_days):
 
 def train_dimensionless_refinement_model(state, device, numgpu, numwork):
     """Train the full refinement model with fixed dimensionless loss scales."""
+    anchor_only = bool(getattr(cfg, "ANCHOR_ONLY_PRETRAIN", False))
+    if anchor_only:
+        if str(cfg.TRAIN_INIT_MODE).lower() != "scratch":
+            raise ValueError("ANCHOR_ONLY_PRETRAIN requires TRAIN_INIT_MODE='scratch'")
+        if str(getattr(cfg, "SCRATCH_INIT_STRATEGY", "")).lower() != "random":
+            raise ValueError("ANCHOR_ONLY_PRETRAIN requires SCRATCH_INIT_STRATEGY='random'")
+        if cfg.do_sites or cfg.do_campaigns or cfg.do_test:
+            raise ValueError("Disable site, campaign and global diagnostics during anchor-only training")
+        if bool(getattr(cfg, "TRAIN_WITH_CAMPAIGNS", False)):
+            raise ValueError("Disable campaign training for anchor-only pretraining")
+        loss_keys = (
+            "lambda_grad", "lambda_nd", "lambda_campaign", "lambda_site_coeff_gauss",
+            "lambda_Ndgauss", "lambda_campaign_gauss", "lambda_sigma",
+            "lambda_campaign_sigma",
+        )
+        for key in loss_keys:
+            if float(cfg.hp.get(key, 0)) != 0:
+                raise ValueError(f"ANCHOR_ONLY_PRETRAIN requires {key}=0")
+        if cfg.UPPER_RELAX_ZONAL_LAMBDA != 0 or cfg.UPPER_RELAX_ANOMALY_LAMBDA != 0:
+            raise ValueError("ANCHOR_ONLY_PRETRAIN requires upper relaxation weights=0")
+        print("[PRETRAIN] ANCHOR ONLY: unmodified random initialization; sigma not trained")
     train_loader, val_loader = core.make_training_loaders(state, numwork)
     in_channels = len(list(state["Nin_2d"].data_vars))
     model = core.build_model(in_channels, numgpu, device, cfg.hp)
@@ -242,6 +271,10 @@ def train_dimensionless_refinement_model(state, device, numgpu, numwork):
         lambda_campaign_sigma=float(cfg.hp.get("lambda_campaign_sigma", 1.0)),
     ).to(device)
 
+    if anchor_only:
+        net = model.module if hasattr(model, "module") else model
+        for p in net.sigma_head.parameters():
+            p.requires_grad_(False)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.Adam(
         params,
