@@ -30,6 +30,8 @@ HOLDOUT_MANIFEST = "NDnet_heldout_observations.json"
 #   "resume"  -> resume MODEL_NAME.ckpt when present; otherwise random init
 TRAIN_INIT_MODE = "weights"
 TRAIN_INIT_WEIGHTS = "./NDnet_EOFcoeff_sigmaFT_weights.pt"
+# Used only for scratch initialization; in EOF coefficient units.
+SCRATCH_INITIAL_SIGMA = 1.0
 
 min_valid_lev = 2
 write_site_debug = False
