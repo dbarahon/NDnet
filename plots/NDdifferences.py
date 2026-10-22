@@ -40,7 +40,7 @@ BASE_VAR = "NDinc_cf01p"
 MODIS_CORRECTED_PATH = "/panfs/ccds02/nobackup/people/dbarahon/NDnet/EOF/inference/monthlies/*.nc4"
 MODIS_CORRECTED_VAR = "NDinc_cf01p_pred"
 
-REFINED_PATH = "/panfs/ccds02/nobackup/people/dbarahon/NDnet/EOF/inference/after_refinement/taper/monthlies/*.nc4"
+REFINED_PATH = "/panfs/ccds02/nobackup/people/dbarahon/NDnet/EOF/inference/after_refinement/monthlies/*.nc4"
 REFINED_VAR = "NDinc_cf01p"
 
 OUT_PNG = "Nd_product_differences.png"
