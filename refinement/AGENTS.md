@@ -1,18 +1,9 @@
-# AGENTS.md
+# Refinement code conventions
 
-## Repository expectations
+The `refinement/` package contains probabilistic EOF-coefficient correction, observation handling, normalized losses, and pressure-dependent regularization.
 
-- Keep edits minimal and local.
-- Do not rename public functions unless required.
-- Preserve existing scientific behavior unless fixing a clear bug.
-- Prefer small interface fixes over large refactors.
-- After editing Python files, run:
-  - python -m compileall .
-  - pytest -q if tests exist
-- If no tests exist, run lightweight import/syntax smoke checks and report exactly what was validated.
-- When reporting issues, pay special attention to:
-  - array shape mismatches
-  - inconsistent tensor dimension ordering
-  - broken imports
-  - circular imports
-  - function signature mismatches across files
+- Preserve function interfaces and tensor dimension conventions across modules.
+- Maintain consistent pressure levels, valid-data masks, and EOF mode ordering.
+- Keep changes to numerical algorithms explicit and verify scientific units.
+- Check syntax with `python -m compileall refinement` and run available tests with `pytest -q refinement/tests`.
+- Validate array shapes, imports, and function signatures when modifying the training or inference interfaces.
